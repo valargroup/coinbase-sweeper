@@ -20,6 +20,8 @@ impl Zat {
     pub fn parse_zec(text: &str) -> Result<Zat> {
         let text = text.trim();
         let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+        // Trailing zeros carry no value: 3.1250000000 is 3.125.
+        let frac = frac.trim_end_matches('0');
         if whole.is_empty() && frac.is_empty() {
             bail!("empty amount");
         }
@@ -129,11 +131,14 @@ mod tests {
         assert_eq!(Zat::parse_zec("0.00000001").unwrap(), Zat(1));
         assert_eq!(Zat::parse_zec("3").unwrap(), Zat(300_000_000));
         assert_eq!(Zat::parse_zec(".5").unwrap(), Zat(50_000_000));
+        assert_eq!(Zat::parse_zec("3.1250000000").unwrap(), Zat(312_500_000));
+        assert_eq!(Zat::parse_zec("0.").unwrap(), Zat(0));
         assert_eq!(Zat(123_456_789).to_string(), "1.23456789");
         assert_eq!(Zat(1).to_json().to_string(), "0.00000001");
         assert_eq!(Zat::from_json(&Zat(1).to_json()).unwrap(), Zat(1));
         let sci = |t: &str| Zat::from_json(&serde_json::from_str::<Value>(t).unwrap()).unwrap();
         assert_eq!(sci("1e-8"), Zat(1));
+        assert_eq!(sci("1.0e-8"), Zat(1));
         assert_eq!(sci("1.5E-3"), Zat(150_000));
         assert_eq!(sci("2.5e1"), Zat(2_500_000_000));
     }

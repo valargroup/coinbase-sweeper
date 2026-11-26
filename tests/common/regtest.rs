@@ -281,9 +281,100 @@ pub fn inputs(tx: &Value) -> Vec<(String, u64)> {
         .collect()
 }
 
-pub fn sweep_section(taddr: &str, extra: &str) -> String {
+/// A [sweep] section. `min_inputs` above 1 keeps a loop from chasing the single reward each
+/// newly mined block matures.
+pub fn sweep_section(taddr: &str, min_inputs: u32) -> String {
     format!(
-        "[sweep]\ncoinbase_addresses = [\"{taddr}\"]\nmin_inputs = 1\nmax_wait_blocks = 0\n\
-         alert_unswept_zec = 100000\n{extra}\n"
+        "[sweep]\ncoinbase_addresses = [\"{taddr}\"]\nmin_inputs = {min_inputs}\n\
+         max_wait_blocks = 1000\nalert_unswept_zec = 100000\n"
     )
+}
+
+/// Every transparent outpoint spent by transactions mined in blocks `from..=tip`, with the
+/// spending txids, read from the node (the chain is the ground truth, not the tool's log).
+pub async fn chain_spends(
+    pool: &Pool,
+    from: u64,
+) -> std::collections::BTreeMap<(String, u64), Vec<String>> {
+    let mut spends: std::collections::BTreeMap<(String, u64), Vec<String>> = Default::default();
+    let tip = pool.tip().await;
+    for h in from..=tip {
+        let hash = pool.zebrad.rpc("getblockhash", json!([h])).await.unwrap();
+        let block = pool.zebrad.rpc("getblock", json!([hash, 1])).await.unwrap();
+        for txid in block["tx"].as_array().unwrap().iter().skip(1) {
+            let tx = pool
+                .zebrad
+                .rpc("getrawtransaction", json!([txid, 1]))
+                .await
+                .unwrap();
+            for i in inputs(&tx) {
+                spends
+                    .entry(i)
+                    .or_default()
+                    .push(txid.as_str().unwrap().to_owned());
+            }
+        }
+    }
+    spends
+}
+
+/// Asserts every outpoint in `mature` was spent exactly once on chain, by a v6 transaction
+/// with no transparent outputs and at least one Ironwood action.
+pub async fn assert_swept_once(pool: &Pool, mature: &BTreeSet<(String, u64)>, from: u64) {
+    let spends = chain_spends(pool, from).await;
+    let mut sweeps = BTreeSet::new();
+    for o in mature {
+        let by = spends
+            .get(o)
+            .unwrap_or_else(|| panic!("mature reward {o:?} was never swept"));
+        assert_eq!(by.len(), 1, "{o:?} spent by {by:?}");
+        sweeps.insert(by[0].clone());
+    }
+    for txid in &sweeps {
+        let tx = pool
+            .zebrad
+            .rpc("getrawtransaction", json!([txid, 1]))
+            .await
+            .unwrap();
+        assert!(tx["vout"].as_array().unwrap().is_empty(), "{tx}");
+        assert!(
+            !tx["ironwood"]["actions"].as_array().unwrap().is_empty(),
+            "{tx}"
+        );
+    }
+    eprintln!(
+        "{} rewards swept once each by {} transactions",
+        mature.len(),
+        sweeps.len()
+    );
+}
+
+impl Pool {
+    /// Mines one block each time the tool's log shows a new confirmation wait, until `done`
+    /// holds or `timeout` passes. Returns how many confirmation waits were served.
+    pub async fn drive(
+        &self,
+        tool: &Tool,
+        mut served: usize,
+        timeout: Duration,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> usize {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let log = tool.log();
+            if done(&log) {
+                return served;
+            }
+            let waits = log.matches("event=wait_confirmation").count();
+            if waits > served {
+                self.mine(1).await;
+                served = waits;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out driving the tool: {log}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
 }

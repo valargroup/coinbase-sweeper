@@ -236,12 +236,20 @@ impl Config {
             "general.max_tip_lag_blocks must be 0-100"
         );
         ensure!(
-            g.operation_timeout_secs >= 10,
-            "general.operation_timeout_secs must be at least 10"
+            (10..=86_400).contains(&g.operation_timeout_secs),
+            "general.operation_timeout_secs must be 10-86400"
         );
         ensure!(
-            g.confirmation_timeout_secs >= 10,
-            "general.confirmation_timeout_secs must be at least 10"
+            (10..=86_400).contains(&g.confirmation_timeout_secs),
+            "general.confirmation_timeout_secs must be 10-86400"
+        );
+        ensure!(
+            (60..=604_800).contains(&g.rejection_pause_secs),
+            "general.rejection_pause_secs must be 60-604800"
+        );
+        ensure!(
+            g.max_backoff_secs <= 86_400,
+            "general.max_backoff_secs must be at most 86400"
         );
         ensure!(
             g.skipped_cycles_before_error >= 1,
@@ -389,16 +397,7 @@ impl RpcConfig {
     /// from `SWEEPER_RPC_PASSWORD`.
     pub fn credentials(&self, env_password: Option<String>) -> Result<Credentials> {
         if let Some(path) = &self.cookie_file {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read rpc.cookie_file {}", path.display()))?;
-            let (user, password) = text
-                .trim()
-                .split_once(':')
-                .context("rpc.cookie_file must hold user:password")?;
-            return Ok(Credentials {
-                user: user.to_owned(),
-                password: password.to_owned(),
-            });
+            return read_cookie(path);
         }
         let user = self
             .user
@@ -410,6 +409,20 @@ impl RpcConfig {
         };
         Ok(Credentials { user, password })
     }
+}
+
+/// Reads a zcashd-style cookie file (`user:password`).
+pub fn read_cookie(path: &Path) -> Result<Credentials> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read rpc.cookie_file {}", path.display()))?;
+    let (user, password) = text
+        .trim()
+        .split_once(':')
+        .context("rpc.cookie_file must hold user:password")?;
+    Ok(Credentials {
+        user: user.to_owned(),
+        password: password.to_owned(),
+    })
 }
 
 #[cfg(test)]

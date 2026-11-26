@@ -6,7 +6,7 @@ pub mod plan;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -16,30 +16,43 @@ use crate::rpc::{RpcError, RPC_WALLET_INSUFFICIENT_FUNDS};
 use crate::runner::{is_node_rejection, Ctx, CycleError, Job, StartupError};
 use crate::startup;
 use crate::txcheck;
-use crate::wallet::{ChainStatus, OpState, COINBASE_MATURITY};
+use crate::wallet::{ChainStatus, OpState, Operation, TxStatus, COINBASE_MATURITY};
 
 /// zcashd's per-transaction default and the most this tool puts in one sweep.
 pub const MAX_INPUTS_PER_SWEEP: u32 = 50;
 
-/// What survives a restart: the last sweep, so the next batch waits for it to confirm.
+/// A sweep the tool has seen succeed but that has not yet been checked or confirmed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SweepRecord {
+    txid: String,
+    address: String,
+    checked: bool,
+}
+
+/// What survives a restart. A sweep stays here until it is checked and has one confirmation, so
+/// no new sweep starts while an earlier one could still be holding the same inputs.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SweepState {
-    last_txid: Option<String>,
+    unconfirmed: Vec<SweepRecord>,
 }
 
 pub struct Sweep {
     cfg: SweepConfig,
 }
 
+enum Batch {
+    /// `remaining` is the wallet's count of mature inputs left, when it reported one.
+    Swept {
+        txid: String,
+        remaining: Option<u64>,
+    },
+    NothingToShield,
+}
+
 impl Sweep {
     pub fn new(cfg: SweepConfig) -> Sweep {
         Sweep { cfg }
     }
-}
-
-enum Batch {
-    Swept { txid: String, remaining: u64 },
-    NothingToShield,
 }
 
 impl Job for Sweep {
@@ -59,36 +72,31 @@ impl Job for Sweep {
             }
         }
         if !ctx.dry_run {
-            // Operations started by an earlier run must finish before new work starts.
-            let waited = wallet
-                .wait_all_pending(op_timeout(ctx))
-                .map_err(startup_error)?;
-            if waited > 0 {
-                log::info!("event=startup_pending_ops_done cmd=sweep count={waited}");
-            }
+            // Operations started by an earlier run must finish before new work starts. Waiting is
+            // never a reason to refuse; it is retried.
+            wallet
+                .settled_operations(op_timeout(ctx))
+                .map_err(|e| StartupError::Unavailable(format!("{e:#}")))?;
         }
         Ok(())
     }
 
-    fn cycle(&mut self, ctx: &Ctx, _chain: &ChainStatus) -> Result<(), CycleError> {
+    fn cycle(&mut self, ctx: &Ctx, chain: &ChainStatus) -> Result<(), CycleError> {
         let wallet = ctx.wallet();
         if !ctx.dry_run {
-            wallet.wait_all_pending(op_timeout(ctx))?;
-            self.wait_last_sweep(ctx)?;
+            self.settle_previous(ctx)?;
+            self.settle_records(ctx, chain)?;
         }
         let utxos = wallet.list_unspent(COINBASE_MATURITY, &self.cfg.coinbase_addresses)?;
         let plans = plan::plan(&utxos, &self.cfg);
-        for p in &plans {
-            if p.alert {
-                log::error!(
-                    "event=unswept_alert cmd=sweep addr={} mature_inputs={} amount={} \
-                     threshold={}",
-                    p.address,
-                    p.mature_count,
-                    p.mature_value,
-                    self.cfg.alert_unswept_zec
-                );
-            }
+        for p in plans.iter().filter(|p| p.alert) {
+            log::error!(
+                "event=unswept_alert cmd=sweep addr={} mature_inputs={} amount={} threshold={}",
+                p.address,
+                p.mature_count,
+                p.mature_value,
+                self.cfg.alert_unswept_zec
+            );
         }
         let mut batches_left = self.cfg.max_batches_per_cycle;
         for p in plans.iter().filter(|p| p.due.is_some()) {
@@ -102,33 +110,39 @@ impl Job for Sweep {
                 p.due
             );
             if ctx.dry_run {
-                let per = self.cfg.max_inputs as usize;
                 log::info!(
                     "event=dry_run cmd=sweep addr={} would_shield_inputs={} batches={}",
                     p.address,
                     p.mature_count,
-                    p.mature_count.div_ceil(per)
+                    p.mature_count.div_ceil(self.cfg.max_inputs as usize)
                 );
                 continue;
             }
             while batches_left > 0 {
                 batches_left -= 1;
-                match self.sweep_batch(ctx, &p.address)? {
+                let (txid, remaining) = match self.sweep_batch(ctx, &p.address)? {
                     Batch::NothingToShield => break,
-                    Batch::Swept { remaining: 0, .. } => break,
-                    Batch::Swept { txid, remaining } => {
-                        if batches_left == 0 {
-                            log::info!(
-                                "event=batch_limit cmd=sweep addr={} remaining_inputs={remaining}",
-                                p.address
-                            );
-                            break;
-                        }
-                        // The wallet may not lock coinbase that is being shielded; one
-                        // confirmation keeps the next batch from selecting the same inputs.
-                        log::info!("event=wait_confirmation cmd=sweep txid={txid}");
-                        wallet.wait_confirmations(&txid, 1, confirm_timeout(ctx))?;
-                    }
+                    Batch::Swept {
+                        remaining: Some(0), ..
+                    } => break,
+                    Batch::Swept { txid, remaining } => (txid, remaining),
+                };
+                if batches_left == 0 {
+                    log::info!(
+                        "event=batch_limit cmd=sweep addr={} remaining_inputs={}",
+                        p.address,
+                        remaining.map_or("unknown".into(), |r| r.to_string())
+                    );
+                    break;
+                }
+                // The wallet may not lock coinbase that is being shielded; one confirmation keeps
+                // the next batch from selecting the same inputs.
+                log::info!("event=wait_confirmation cmd=sweep txid={txid}");
+                let status = wallet.wait_confirmations(&txid, 1, confirm_timeout(ctx))?;
+                self.forget(ctx, &txid)?;
+                if status == TxStatus::Gone {
+                    log::warn!("event=sweep_gone cmd=sweep txid={txid} note=inputs_unspent_again");
+                    break;
                 }
             }
         }
@@ -143,29 +157,127 @@ impl Job for Sweep {
 }
 
 impl Sweep {
-    /// Waits for the previous run's last sweep to confirm before selecting inputs again.
-    fn wait_last_sweep(&self, ctx: &Ctx) -> Result<(), CycleError> {
-        let state: SweepState = ctx.state.read_json("state")?.unwrap_or_default();
-        let Some(txid) = state.last_txid else {
-            return Ok(());
-        };
-        match ctx.wallet().confirmations(&txid) {
-            Ok(c) if c >= 1 => {}
-            Ok(_) => {
-                log::info!("event=wait_confirmation cmd=sweep txid={txid} note=previous_sweep");
-                ctx.wallet()
-                    .wait_confirmations(&txid, 1, confirm_timeout(ctx))?;
+    fn load(&self, ctx: &Ctx) -> Result<SweepState, CycleError> {
+        Ok(ctx.state.read_json("state")?.unwrap_or_default())
+    }
+
+    fn save(&self, ctx: &Ctx, state: &SweepState) -> Result<(), CycleError> {
+        Ok(ctx.state.write_json("state", state)?)
+    }
+
+    /// Drops a confirmed (or permanently failed) sweep from the state file.
+    fn forget(&self, ctx: &Ctx, txid: &str) -> Result<(), CycleError> {
+        let mut state = self.load(ctx)?;
+        state.unconfirmed.retain(|r| r.txid != txid);
+        self.save(ctx, &state)
+    }
+
+    /// Waits for every running wallet operation, then accounts for sweeps an earlier run started
+    /// but did not see finish (it was killed, or lost its connection): each is logged with its
+    /// txid, recorded and checked. Other software's operations are waited for but never cleared.
+    fn settle_previous(&self, ctx: &Ctx) -> Result<(), CycleError> {
+        let wallet = ctx.wallet();
+        for op in wallet.settled_operations(op_timeout(ctx))? {
+            let Some(from) = self.own_sweep_source(ctx, &op) else {
+                continue;
+            };
+            wallet.clear_operation(&op.id);
+            match op.state {
+                OpState::Success { txid } => {
+                    log::info!(
+                        "event=swept cmd=sweep addr={from} txid={txid} opid={} \
+                         outcome=ok_recovered",
+                        op.id
+                    );
+                    self.record_and_check(ctx, &from, &txid)?;
+                }
+                other => log::warn!(
+                    "event=recovered_op cmd=sweep addr={from} opid={} state={other:?}",
+                    op.id
+                ),
             }
-            // The wallet no longer knows the transaction (it expired or was dropped): its inputs
-            // are unspent again and will be listed.
-            Err(RpcError::Rpc { code: -5, .. }) => {
-                log::warn!("event=previous_sweep_unknown cmd=sweep txid={txid}");
-            }
-            Err(e) => return Err(e.into()),
         }
-        ctx.state
-            .write_json("state", &SweepState { last_txid: None })?;
         Ok(())
+    }
+
+    /// Checks any recorded sweep not yet checked, and waits for each to confirm.
+    fn settle_records(&self, ctx: &Ctx, chain: &ChainStatus) -> Result<(), CycleError> {
+        let state = self.load(ctx)?;
+        for r in state.unconfirmed {
+            if !r.checked {
+                self.check(ctx, &r.address, &r.txid)?;
+            }
+            let status = match ctx.wallet().tx_status(&r.txid, chain.wallet_height)? {
+                TxStatus::Pending => {
+                    log::info!(
+                        "event=wait_confirmation cmd=sweep txid={} note=previous_sweep",
+                        r.txid
+                    );
+                    ctx.wallet()
+                        .wait_confirmations(&r.txid, 1, confirm_timeout(ctx))?
+                }
+                s => s,
+            };
+            if status == TxStatus::Gone {
+                log::warn!(
+                    "event=sweep_gone cmd=sweep addr={} txid={} note=inputs_unspent_again",
+                    r.address,
+                    r.txid
+                );
+            }
+            self.forget(ctx, &r.txid)?;
+        }
+        Ok(())
+    }
+
+    /// The source address when `op` is a sweep this tool would have started.
+    fn own_sweep_source(&self, ctx: &Ctx, op: &Operation) -> Option<String> {
+        if op.method.as_deref() != Some("z_shieldcoinbase") {
+            return None;
+        }
+        let from = op.params.get("fromaddress")?.as_str()?;
+        let to = op.params.get("toaddress")?.as_str()?;
+        (to == ctx.cfg.shielded_address && self.cfg.coinbase_addresses.iter().any(|a| a == from))
+            .then(|| from.to_owned())
+    }
+
+    /// Records a sweep (before anything else can fail) and checks it.
+    fn record_and_check(&self, ctx: &Ctx, address: &str, txid: &str) -> Result<(), CycleError> {
+        let mut state = self.load(ctx)?;
+        if !state.unconfirmed.iter().any(|r| r.txid == txid) {
+            state.unconfirmed.push(SweepRecord {
+                txid: txid.to_owned(),
+                address: address.to_owned(),
+                checked: false,
+            });
+            self.save(ctx, &state)?;
+        }
+        self.check(ctx, address, txid)
+    }
+
+    /// Checks a recorded sweep and marks it checked. A transaction that fails the check, or that
+    /// can no longer be found to check, halts the command.
+    fn check(&self, ctx: &Ctx, address: &str, txid: &str) -> Result<(), CycleError> {
+        let tx = match ctx.wallet().transaction(txid) {
+            Ok(tx) => tx,
+            Err(e) if e.is_transient() => return Err(e.into()),
+            Err(e) => {
+                return Err(CycleError::Halt(format!(
+                    "sweep {txid} from {address} cannot be fetched to check it ({e}); verify it \
+                     by hand"
+                )))
+            }
+        };
+        if let Err(e) = txcheck::check_sweep(&tx) {
+            return Err(CycleError::Halt(format!(
+                "sweep {txid} from {address} failed its check: {e:#}"
+            )));
+        }
+        let mut state = self.load(ctx)?;
+        for r in state.unconfirmed.iter_mut().filter(|r| r.txid == txid) {
+            r.checked = true;
+        }
+        self.save(ctx, &state)
     }
 
     fn sweep_batch(&self, ctx: &Ctx, address: &str) -> Result<Batch, CycleError> {
@@ -183,39 +295,28 @@ impl Sweep {
                 log::info!("event=nothing_to_shield cmd=sweep addr={address} detail={message:?}");
                 return Ok(Batch::NothingToShield);
             }
-            Err(e @ RpcError::NoAnswer(_)) => {
-                // The wallet may or may not have started the sweep. Never resend: settle any
-                // operation it did start, then end the cycle.
-                log::error!("event=submit_unknown cmd=sweep addr={address} err={e}");
-                self.settle_unknown(ctx, address, &ops_before)?;
-                return Err(CycleError::Failed(anyhow!(
-                    "the z_shieldcoinbase call for {address} got no answer; not resending in \
-                     this cycle"
-                )));
+            Err(e) if e.outcome_unknown() => {
+                return Err(self.unknown(ctx, address, &ops_before, e))
             }
+            // Unreachable, still warming up, or a definite refusal: the wallet did not act.
             Err(e) => return Err(e.into()),
         };
-        let opid = reply
-            .get("opid")
-            .and_then(Value::as_str)
-            .context("z_shieldcoinbase returned no opid")?
-            .to_owned();
-        let inputs = reply
-            .get("shieldingUTXOs")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let Some(opid) = reply.get("opid").and_then(Value::as_str).map(str::to_owned) else {
+            let e = RpcError::Protocol(format!("z_shieldcoinbase returned no opid: {reply}"));
+            return Err(self.unknown(ctx, address, &ops_before, e));
+        };
+        let inputs = reply.get("shieldingUTXOs").and_then(Value::as_u64);
         let value = reply
             .get("shieldingValue")
-            .map(Zat::from_json)
-            .transpose()?
-            .unwrap_or_default();
-        let remaining = reply
-            .get("remainingUTXOs")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .and_then(|v| Zat::from_json(v).ok());
+        let remaining = reply.get("remainingUTXOs").and_then(Value::as_u64);
+        let shown = |v: Option<String>| v.unwrap_or_else(|| "unknown".into());
+        let inputs = shown(inputs.map(|n| n.to_string()));
+        let value = shown(value.map(|z| z.to_string()));
         log::info!(
             "event=sweep_submitted cmd=sweep addr={address} inputs={inputs} amount={value} \
-             remaining_inputs={remaining} opid={opid}"
+             remaining_inputs={} opid={opid}",
+            shown(remaining.map(|n| n.to_string())),
         );
         let txid = self.finish_operation(ctx, address, &opid)?;
         log::info!(
@@ -225,11 +326,11 @@ impl Sweep {
         Ok(Batch::Swept { txid, remaining })
     }
 
-    /// Waits for a sweep operation, records its transaction and checks it.
+    /// Waits for a sweep operation, then records and checks its transaction.
     fn finish_operation(&self, ctx: &Ctx, address: &str, opid: &str) -> Result<String, CycleError> {
         let state = ctx
             .wallet()
-            .wait_operation(opid, op_timeout(ctx))?
+            .wait_operation(opid, op_timeout(ctx), true)?
             .ok_or_else(|| {
                 CycleError::Failed(anyhow!(
                     "the wallet lost operation {opid} (did it restart?); its outcome will show \
@@ -256,44 +357,52 @@ impl Sweep {
                 )))
             }
         };
-        ctx.state.write_json(
-            "state",
-            &SweepState {
-                last_txid: Some(txid.clone()),
-            },
-        )?;
-        // Check now, while the transaction is in the mempool: a node without a transaction
-        // index cannot find it later.
-        let tx = ctx.wallet().raw_transaction(&txid)?;
-        if let Err(e) = txcheck::check_sweep(&tx) {
-            return Err(CycleError::Halt(format!(
-                "sweep {txid} from {address} failed its check: {e:#}"
-            )));
-        }
+        self.record_and_check(ctx, address, &txid)?;
         Ok(txid)
     }
 
-    /// After a submission with no answer: wait for and check any operation that appeared.
-    fn settle_unknown(
+    /// A submission whose outcome is unknown: settle any sweep of ours that appeared, then end
+    /// the cycle. Never resend.
+    fn unknown(
         &self,
         ctx: &Ctx,
         address: &str,
         ops_before: &HashSet<String>,
-    ) -> Result<(), CycleError> {
-        let new_ops: Vec<String> = ctx
-            .wallet()
-            .operation_ids()?
-            .into_iter()
-            .filter(|id| !ops_before.contains(id))
-            .collect();
-        if new_ops.is_empty() {
-            log::warn!("event=submit_unknown_settled cmd=sweep addr={address} new_operations=0");
+        e: RpcError,
+    ) -> CycleError {
+        log::error!("event=submit_unknown cmd=sweep addr={address} err={e}");
+        let settle = || -> Result<(), CycleError> {
+            let wallet = ctx.wallet();
+            let ids: Vec<String> = wallet
+                .operation_ids()?
+                .into_iter()
+                .filter(|id| !ops_before.contains(id))
+                .collect();
+            let ours: Vec<Operation> = wallet
+                .operations(&ids)?
+                .into_iter()
+                .filter(|op| self.own_sweep_source(ctx, op).as_deref() == Some(address))
+                .collect();
+            if ours.is_empty() {
+                log::warn!("event=submit_unknown_settled cmd=sweep addr={address} new_sweeps=0");
+            }
+            for op in ours {
+                let txid = self.finish_operation(ctx, address, &op.id)?;
+                log::info!(
+                    "event=swept cmd=sweep addr={address} txid={txid} opid={} \
+                     outcome=ok_after_unknown",
+                    op.id
+                );
+            }
+            Ok(())
+        };
+        match settle() {
+            Ok(()) => CycleError::Failed(anyhow!(
+                "the z_shieldcoinbase call for {address} got no usable answer ({e}); not \
+                 resending in this cycle"
+            )),
+            Err(other) => other,
         }
-        for opid in new_ops {
-            let txid = self.finish_operation(ctx, address, &opid)?;
-            log::info!("event=swept cmd=sweep addr={address} txid={txid} outcome=ok_after_unknown");
-        }
-        Ok(())
     }
 }
 
@@ -303,9 +412,4 @@ fn op_timeout(ctx: &Ctx) -> Duration {
 
 fn confirm_timeout(ctx: &Ctx) -> Duration {
     Duration::from_secs(ctx.cfg.general.confirmation_timeout_secs)
-}
-
-/// Waiting on an earlier operation is never a reason to refuse; it is retried.
-fn startup_error(e: anyhow::Error) -> StartupError {
-    StartupError::Unavailable(format!("{e:#}"))
 }

@@ -10,7 +10,10 @@ pub fn check_shielded_address(ctx: &Ctx) -> Result<(), StartupError> {
     let ua = &ctx.cfg.shielded_address;
     let wallet = ctx.wallet();
     let receivers = wallet.unified_receivers(ua).map_err(|e| match e {
-        e if e.is_connectivity() => StartupError::from(e),
+        e @ (crate::rpc::RpcError::Auth(_) | crate::rpc::RpcError::Protocol(_)) => {
+            StartupError::Refuse(anyhow!(e))
+        }
+        e if e.is_transient() => StartupError::from(e),
         e => StartupError::Refuse(anyhow!(
             "shielded_address {ua} is not a unified address this wallet can read: {e}"
         )),

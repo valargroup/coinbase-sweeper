@@ -180,6 +180,7 @@ pub const TADDR: &str = "tmPool";
 /// outputs at `TADDR`. Each z_shieldcoinbase takes up to 50 and produces a valid v6 sweep.
 pub fn healthy_sweep_wallet(mature: usize) -> FakeRpc {
     let f = FakeRpc::start();
+    f.on("getconnectioncount", |_| Reply::Ok(json!(1)));
     f.on("getblockchaininfo", |_| {
         Reply::Ok(json!({"blocks": 500, "headers": 500, "initialblockdownload": false}))
     });

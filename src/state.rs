@@ -74,13 +74,21 @@ impl StateDir {
         self.path("halt")
     }
 
-    /// The reason the command was halted, if an earlier run halted it.
+    /// Why sending is halted, if it is. A halt marker from either command stops both: a wallet
+    /// that built one wrong transaction is not trusted with the other kind either.
     pub fn halted(&self) -> Result<Option<String>> {
-        match fs::read_to_string(self.halt_path()) {
-            Ok(s) => Ok(Some(s.trim().to_owned())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).context("cannot read the halt marker"),
+        for command in [Command::Sweep, Command::Refill] {
+            let path = self.dir.join(format!("{}.halt", command.name()));
+            match fs::read_to_string(&path) {
+                Ok(s) => return Ok(Some(format!("{} ({})", s.trim(), path.display()))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("cannot read halt marker {}", path.display()))
+                }
+            }
         }
+        Ok(None)
     }
 
     /// Stops the command from sending anything until an operator removes the marker.
@@ -117,7 +125,9 @@ impl StateDir {
 }
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     {
         let mut f =
             File::create(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -157,7 +167,10 @@ mod tests {
         let s = StateDir::new(dir.path(), Command::Refill).unwrap();
         assert_eq!(s.halted().unwrap(), None);
         s.halt("bad tx").unwrap();
-        assert_eq!(s.halted().unwrap().as_deref(), Some("bad tx"));
+        assert!(s.halted().unwrap().unwrap().starts_with("bad tx"));
+        // The other command sees it too.
+        let sweep = StateDir::new(dir.path(), Command::Sweep).unwrap();
+        assert!(sweep.halted().unwrap().is_some());
         s.pause_until(now_unix() + 100).unwrap();
         assert!(s.paused_until().unwrap().is_some());
         s.pause_until(1).unwrap();

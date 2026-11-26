@@ -96,6 +96,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
     let rpc = Rpc::new(
         &cfg.rpc.url,
         &credentials,
+        cfg.rpc.cookie_file.clone(),
         cfg.read_timeout(),
         cfg.submit_timeout(),
         cfg.rpc.read_retries,

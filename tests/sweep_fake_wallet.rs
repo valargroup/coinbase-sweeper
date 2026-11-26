@@ -15,7 +15,7 @@ fn client(url: &str, timeout: Duration) -> Rpc {
         user: "pool".into(),
         password: "pw".into(),
     };
-    Rpc::new(url, &cred, timeout, timeout, 2)
+    Rpc::new(url, &cred, None, timeout, timeout, 2)
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn dropped_connection_on_a_read_is_retried() {
         if std::mem::take(&mut first) {
             Reply::Drop
         } else {
-            Reply::Ok(json!({"blocks": 1}))
+            Reply::Ok(json!({"blocks": 1, "headers": 1}))
         }
     });
     let v = client(&f.url, Duration::from_secs(2))
@@ -250,4 +250,101 @@ fn dry_run_and_check_send_nothing() {
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("mature_unswept=120"), "{stdout}");
     assert_eq!(f.calls("z_shieldcoinbase"), 0);
+}
+
+#[test]
+fn bad_gateway_on_a_send_is_not_resent() {
+    let f = healthy_sweep_wallet(10);
+    f.on("z_shieldcoinbase", |_| Reply::Status(502));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sweep_config(dir.path(), &f.url, "");
+    let (code, err) = run_bin(&["sweep", "--config", cfg.to_str().unwrap(), "--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=submit_unknown"), "{err}");
+    assert_eq!(f.calls("z_shieldcoinbase"), 1);
+}
+
+#[test]
+fn cookie_is_reread_after_401() {
+    let f = healthy_sweep_wallet(0);
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join(".cookie");
+    std::fs::write(&cookie, "__cookie__:old").unwrap();
+    let cred = coinbase_sweeper::config::read_cookie(&cookie).unwrap();
+    let rpc = Rpc::new(
+        &f.url,
+        &cred,
+        Some(cookie.clone()),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        0,
+    );
+    // The wallet restarted and wrote a new cookie: the old one is refused once.
+    let mut first = true;
+    f.on("getblockchaininfo", move |_| {
+        if std::mem::take(&mut first) {
+            Reply::Status(401)
+        } else {
+            Reply::Ok(json!({"blocks": 1, "headers": 1}))
+        }
+    });
+    std::fs::write(&cookie, "__cookie__:new").unwrap();
+    rpc.read("getblockchaininfo", json!([])).unwrap();
+    assert_eq!(f.calls("getblockchaininfo"), 2);
+}
+
+#[test]
+fn other_programs_operations_are_waited_for_but_not_cleared() {
+    let f = healthy_sweep_wallet(3);
+    f.on("z_listoperationids", |_| Reply::Ok(json!(["opid-payout"])));
+    f.on("z_getoperationstatus", |p| {
+        let id = p[0][0].as_str().unwrap().to_owned();
+        if id == "opid-payout" {
+            return Reply::Ok(
+                json!([{"id": id, "status": "success", "method": "z_sendmany",
+                                      "params": {"fromaddress": "tmPayout"},
+                                      "result": {"txid": "payout"}}]),
+            );
+        }
+        Reply::Ok(
+            json!([{"id": id, "status": "success", "method": "z_shieldcoinbase",
+                          "result": {"txid": format!("tx-{id}")}}]),
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sweep_config(dir.path(), &f.url, "");
+    let (code, err) = run_bin(&["sweep", "--config", cfg.to_str().unwrap(), "--once"]);
+    assert_eq!(code, 0, "{err}");
+    for p in f.params("z_getoperationresult") {
+        assert_ne!(
+            p,
+            json!([["opid-payout"]]),
+            "cleared another program's result"
+        );
+    }
+}
+
+#[test]
+fn an_expired_previous_sweep_does_not_wedge_the_command() {
+    let f = healthy_sweep_wallet(3);
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("sweep.state"),
+        r#"{"unconfirmed": [{"txid": "old", "address": "tmPool", "checked": true}]}"#,
+    )
+    .unwrap();
+    f.on("gettransaction", |p| {
+        if p[0] == "old" {
+            Reply::Ok(json!({"confirmations": 0, "expiryheight": 450}))
+        } else {
+            Reply::Ok(json!({"confirmations": 1}))
+        }
+    });
+    let cfg = sweep_config(dir.path(), &f.url, "");
+    let (code, err) = run_bin(&["sweep", "--config", cfg.to_str().unwrap(), "--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("event=sweep_gone"), "{err}");
+    assert_eq!(f.calls("z_shieldcoinbase"), 1);
 }

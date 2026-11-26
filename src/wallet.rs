@@ -32,6 +32,15 @@ pub struct Utxo {
     pub generated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxStatus {
+    Confirmed(u64),
+    /// In the mempool (or not yet relayed).
+    Pending,
+    /// Unknown to the wallet, conflicted or expired: it will never confirm.
+    Gone,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpState {
     Queued,
@@ -113,9 +122,16 @@ impl<'a> Wallet<'a> {
         parse_operations(&v).map_err(|e| RpcError::Protocol(format!("z_getoperationstatus: {e:#}")))
     }
 
-    /// Polls one operation until it finishes, then clears it from the wallet's memory.
+    /// Polls one operation until it finishes. With `clear`, the finished result is then removed
+    /// from the wallet's memory; only the tool's own operations are cleared, so other software
+    /// polling the same wallet (the pool's payout code) still finds its results.
     /// `Ok(None)` means the wallet no longer knows the operation (it restarted).
-    pub fn wait_operation(&self, opid: &str, timeout: Duration) -> Result<Option<OpState>> {
+    pub fn wait_operation(
+        &self,
+        opid: &str,
+        timeout: Duration,
+        clear: bool,
+    ) -> Result<Option<OpState>> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(200);
         loop {
@@ -123,9 +139,8 @@ impl<'a> Wallet<'a> {
             match ops.into_iter().find(|o| o.id == opid) {
                 None => return Ok(None),
                 Some(op) if op.state.is_finished() => {
-                    // Best effort: an uncleared result only costs the wallet a little memory.
-                    if let Err(e) = self.rpc.read("z_getoperationresult", json!([[opid]])) {
-                        log::warn!("event=op_clear_failed opid={opid} err={e}");
+                    if clear {
+                        self.clear_operation(opid);
                     }
                     return Ok(Some(op.state));
                 }
@@ -139,46 +154,86 @@ impl<'a> Wallet<'a> {
         }
     }
 
-    /// Waits for every queued or executing operation the wallet knows about.
-    pub fn wait_all_pending(&self, timeout: Duration) -> Result<usize> {
+    /// Removes a finished operation's result. Best effort: an uncleared result only costs the
+    /// wallet a little memory.
+    pub fn clear_operation(&self, opid: &str) {
+        if let Err(e) = self.rpc.read("z_getoperationresult", json!([[opid]])) {
+            log::warn!("event=op_clear_failed opid={opid} err={e}");
+        }
+    }
+
+    /// Waits until no operation is queued or executing, then returns every operation the wallet
+    /// still remembers, all finished. Results are not cleared.
+    pub fn settled_operations(&self, timeout: Duration) -> Result<Vec<Operation>> {
         let ids = self.operation_ids()?;
-        let pending: Vec<Operation> = self
-            .operations(&ids)?
-            .into_iter()
-            .filter(|o| !o.state.is_finished())
-            .collect();
-        for op in &pending {
+        let mut ops = self.operations(&ids)?;
+        for op in ops.iter_mut().filter(|o| !o.state.is_finished()) {
             log::info!(
                 "event=wait_pending_op opid={} method={}",
                 op.id,
                 op.method.as_deref().unwrap_or("?")
             );
-            self.wait_operation(&op.id, timeout)?;
+            match self.wait_operation(&op.id, timeout, false)? {
+                Some(state) => op.state = state,
+                // Forgotten by a wallet restart; nothing left to wait for.
+                None => op.state = OpState::Cancelled,
+            }
         }
-        Ok(pending.len())
+        Ok(ops)
     }
 
     pub fn raw_transaction(&self, txid: &str) -> Result<Value, RpcError> {
         self.rpc.read("getrawtransaction", json!([txid, 1]))
     }
 
-    /// Confirmations of a wallet transaction; 0 while it is in the mempool.
-    pub fn confirmations(&self, txid: &str) -> Result<u64, RpcError> {
-        let v = self.rpc.read("gettransaction", json!([txid]))?;
-        // A conflicted transaction reports -1; treat it as unconfirmed.
-        Ok(v.get("confirmations")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0) as u64)
+    /// The verbose transaction. Falls back to decoding the wallet's own copy, for a node that has
+    /// no transaction index once the transaction is mined.
+    pub fn transaction(&self, txid: &str) -> Result<Value, RpcError> {
+        match self.raw_transaction(txid) {
+            Err(RpcError::Rpc { code: -5, .. }) => {
+                let wtx = self.rpc.read("gettransaction", json!([txid]))?;
+                let hex = wtx.get("hex").and_then(Value::as_str).ok_or_else(|| {
+                    RpcError::Protocol(format!("gettransaction {txid} has no hex"))
+                })?;
+                self.rpc.read("decoderawtransaction", json!([hex]))
+            }
+            other => other,
+        }
     }
 
-    pub fn wait_confirmations(&self, txid: &str, want: u64, timeout: Duration) -> Result<()> {
+    /// Where a wallet transaction stands, from `gettransaction`. `tip` is the wallet's height.
+    pub fn tx_status(&self, txid: &str, tip: u64) -> Result<TxStatus, RpcError> {
+        let v = match self.rpc.read("gettransaction", json!([txid])) {
+            Err(RpcError::Rpc { code: -5, .. }) => return Ok(TxStatus::Gone),
+            other => other?,
+        };
+        let confirmations = v.get("confirmations").and_then(Value::as_i64).unwrap_or(0);
+        if confirmations > 0 {
+            return Ok(TxStatus::Confirmed(confirmations as u64));
+        }
+        // -1: conflicted (its inputs were spent elsewhere). An unmined transaction past its
+        // expiry height can never be mined.
+        let expired = v.get("status").and_then(Value::as_str) == Some("expired")
+            || v.get("expiryheight")
+                .and_then(Value::as_u64)
+                .is_some_and(|h| h > 0 && tip > h);
+        if confirmations < 0 || expired {
+            return Ok(TxStatus::Gone);
+        }
+        Ok(TxStatus::Pending)
+    }
+
+    /// Waits until `txid` has `want` confirmations, or returns `TxStatus::Gone` early when it can
+    /// no longer confirm.
+    pub fn wait_confirmations(&self, txid: &str, want: u64, timeout: Duration) -> Result<TxStatus> {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.confirmations(txid) {
-                Ok(c) if c >= want => return Ok(()),
+            let tip = self.chain_status().map(|c| c.wallet_height).unwrap_or(0);
+            match self.tx_status(txid, tip) {
+                Ok(TxStatus::Confirmed(c)) if c >= want => return Ok(TxStatus::Confirmed(c)),
+                Ok(TxStatus::Gone) => return Ok(TxStatus::Gone),
                 Ok(_) => {}
-                Err(e) if e.is_connectivity() => log::warn!("event=confirm_poll_failed err={e}"),
+                Err(e) if e.is_transient() => log::warn!("event=confirm_poll_failed err={e}"),
                 Err(e) => return Err(anyhow!(e).context(format!("gettransaction {txid}"))),
             }
             if Instant::now() >= deadline {
@@ -222,15 +277,19 @@ impl<'a> Wallet<'a> {
 
 pub fn parse_chain_status(v: &Value) -> Result<ChainStatus> {
     let wallet_height = u64_field(v, "blocks")?;
-    let node_height = v
-        .get("headers")
-        .and_then(Value::as_u64)
-        .unwrap_or(wallet_height)
-        .max(wallet_height);
+    let node_height = u64_field(v, "headers")?.max(wallet_height);
+    // zecd keeps `initialblockdownload` true while it backfills details of transactions it has
+    // already scanned; that does not affect balances. Syncing means the flag plus a block scan
+    // or verification that is not yet complete.
+    let progress = v
+        .get("verificationprogress")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let initial_block_download = v
         .get("initialblockdownload")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && progress < 0.999;
     Ok(ChainStatus {
         wallet_height,
         node_height,
@@ -347,5 +406,19 @@ mod tests {
         let s = parse_chain_status(&json!({"blocks": 10, "headers": 12})).unwrap();
         assert_eq!((s.wallet_height, s.node_height), (10, 12));
         assert!(parse_chain_status(&json!({"headers": 12})).is_err());
+        assert!(
+            parse_chain_status(&json!({"blocks": 12})).is_err(),
+            "fails closed"
+        );
+        let ibd = |p: f64| {
+            parse_chain_status(
+                &json!({"blocks": 1, "headers": 1, "initialblockdownload": true,
+                                       "verificationprogress": p}),
+            )
+            .unwrap()
+            .initial_block_download
+        };
+        assert!(ibd(0.5));
+        assert!(!ibd(1.0), "fully scanned, only backfilling details");
     }
 }

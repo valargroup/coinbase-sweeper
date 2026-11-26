@@ -45,7 +45,7 @@ pub enum StartupError {
 
 impl From<RpcError> for StartupError {
     fn from(e: RpcError) -> Self {
-        if e.is_connectivity() {
+        if e.is_transient() {
             StartupError::Unavailable(e.to_string())
         } else {
             StartupError::Refuse(anyhow!(e))
@@ -67,7 +67,7 @@ pub enum CycleError {
 
 impl From<RpcError> for CycleError {
     fn from(e: RpcError) -> Self {
-        if e.is_connectivity() {
+        if e.is_transient() {
             CycleError::Skip(e.to_string())
         } else {
             CycleError::Failed(anyhow!(e))
@@ -78,7 +78,7 @@ impl From<RpcError> for CycleError {
 impl From<anyhow::Error> for CycleError {
     fn from(e: anyhow::Error) -> Self {
         match e.downcast_ref::<RpcError>() {
-            Some(r) if r.is_connectivity() => CycleError::Skip(format!("{e:#}")),
+            Some(r) if r.is_transient() => CycleError::Skip(format!("{e:#}")),
             _ => CycleError::Failed(e),
         }
     }
@@ -94,13 +94,21 @@ pub trait Job {
 /// The per-cycle gate: skip while the node is syncing or the wallet is behind the node.
 pub fn chain_gate(ctx: &Ctx) -> Result<ChainStatus, CycleError> {
     let status = ctx.wallet().chain_status()?;
+    // zecd reports its link to the node here; zcashd its peer count. Either way, zero means a
+    // transaction built now could not be broadcast.
+    let connections = ctx.rpc.read("getconnectioncount", serde_json::json!([]))?;
+    if connections.as_u64() == Some(0) {
+        return Err(CycleError::Skip(
+            "the wallet has no connection to the node or network".into(),
+        ));
+    }
     if status.initial_block_download {
         return Err(CycleError::Skip(format!(
             "the node or wallet is still syncing (wallet height {}, node height {})",
             status.wallet_height, status.node_height
         )));
     }
-    let lag = status.node_height - status.wallet_height;
+    let lag = status.node_height.saturating_sub(status.wallet_height);
     if lag > ctx.cfg.general.max_tip_lag_blocks {
         return Err(CycleError::Skip(format!(
             "the wallet is {lag} blocks behind the node (wallet {}, node {})",
@@ -120,22 +128,29 @@ pub fn is_node_rejection(code: i64, message: &str) -> bool {
         || m.contains("consensus")
 }
 
-pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
-    let cmd = ctx.state_command();
+/// Logs and returns the halt reason when sending is halted. An unreadable marker counts as
+/// halted.
+fn halt_reason(ctx: &Ctx, cmd: &str) -> Option<String> {
     match ctx.state.halted() {
-        Ok(None) => {}
+        Ok(None) => None,
         Ok(Some(reason)) => {
             log::error!(
                 "event=refused cmd={cmd} reason=halted detail={reason:?} fix=\"investigate, then \
-                 delete {}\"",
-                ctx.state.halt_path().display()
+                 delete the marker file\""
             );
-            return Exit::Refused;
+            Some(reason)
         }
         Err(e) => {
             log::error!("event=refused cmd={cmd} reason={e:#}");
-            return Exit::Refused;
+            Some(format!("{e:#}"))
         }
+    }
+}
+
+pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
+    let cmd = ctx.state_command();
+    if halt_reason(ctx, cmd).is_some() {
+        return Exit::Refused;
     }
 
     let g = &ctx.cfg.general;
@@ -162,7 +177,7 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
                     return Exit::Failed;
                 }
                 std::thread::sleep(backoff(attempts));
-                attempts += 1;
+                attempts = attempts.saturating_add(1);
             }
         }
     }
@@ -171,14 +186,29 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
     let mut skips: u32 = 0;
     let mut failures: u32 = 0;
     loop {
-        if let Ok(Some(until)) = ctx.state.paused_until() {
-            let left = until.saturating_sub(now_unix());
-            log::warn!("event=paused cmd={cmd} seconds_left={left} reason=node_rejection");
-            if once {
-                return Exit::Failed;
+        // An operator (or the other command) may halt sending at any time.
+        if halt_reason(ctx, cmd).is_some() {
+            return Exit::Refused;
+        }
+        match ctx.state.paused_until() {
+            Ok(None) => {}
+            Ok(Some(until)) => {
+                let left = until.saturating_sub(now_unix());
+                log::warn!("event=paused cmd={cmd} seconds_left={left} reason=node_rejection");
+                if once {
+                    return Exit::Failed;
+                }
+                std::thread::sleep(Duration::from_secs(left.clamp(1, g.max_backoff_secs)));
+                continue;
             }
-            std::thread::sleep(Duration::from_secs(left.min(g.max_backoff_secs).max(1)));
-            continue;
+            Err(e) => {
+                log::error!("event=paused cmd={cmd} reason=unreadable_pause_marker err={e:#}");
+                if once {
+                    return Exit::Failed;
+                }
+                std::thread::sleep(Duration::from_secs(g.max_backoff_secs));
+                continue;
+            }
         }
         let calls_before = ctx.rpc.calls();
         let started = std::time::Instant::now();
@@ -199,7 +229,7 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
                 interval
             }
             Err(CycleError::Skip(reason)) => {
-                skips += 1;
+                skips = skips.saturating_add(1);
                 if skips == g.skipped_cycles_before_error {
                     log::error!(
                         "event=cycle_skipped cmd={cmd} consecutive={skips} reason={reason:?} \
@@ -216,18 +246,22 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
                 backoff(skips - 1)
             }
             Err(CycleError::Rejected(reason)) => {
-                let until = now_unix() + g.rejection_pause_secs;
                 log::error!(
                     "event=node_rejected cmd={cmd} reason={reason:?} paused_seconds={}",
                     g.rejection_pause_secs
                 );
-                if let Err(e) = ctx.state.pause_until(until) {
+                if let Err(e) = ctx
+                    .state
+                    .pause_until(now_unix().saturating_add(g.rejection_pause_secs))
+                {
                     log::error!("event=state_write_failed cmd={cmd} err={e:#}");
                 }
                 if once {
                     return Exit::Failed;
                 }
-                continue;
+                // Pause in-process too, so a marker that could not be written cannot turn a
+                // rejection into a resubmit loop.
+                Duration::from_secs(g.rejection_pause_secs)
             }
             Err(CycleError::Halt(reason)) => {
                 log::error!(
@@ -235,12 +269,17 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
                     ctx.state.halt_path().display()
                 );
                 if let Err(e) = ctx.state.halt(&reason) {
+                    // Without the marker a restart would resume sending: stay up and idle.
                     log::error!("event=state_write_failed cmd={cmd} err={e:#}");
+                    loop {
+                        log::error!("event=halted cmd={cmd} reason={reason:?} marker=unwritten");
+                        std::thread::sleep(Duration::from_secs(g.max_backoff_secs));
+                    }
                 }
                 return Exit::Failed;
             }
             Err(CycleError::Failed(e)) => {
-                failures += 1;
+                failures = failures.saturating_add(1);
                 log::error!("event=cycle_failed cmd={cmd} consecutive={failures} err={e:#}");
                 if once {
                     return Exit::Failed;

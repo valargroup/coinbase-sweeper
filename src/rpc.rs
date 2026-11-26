@@ -5,7 +5,9 @@
 //! is lost, the caller must find out what the wallet did instead of sending again.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine;
@@ -15,6 +17,8 @@ use crate::config::Credentials;
 
 /// zcashd's "wallet has insufficient funds" / "nothing to shield" code.
 pub const RPC_WALLET_INSUFFICIENT_FUNDS: i64 = -6;
+/// zcashd's "still loading" code during startup.
+pub const RPC_IN_WARMUP: i64 = -28;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
@@ -27,6 +31,9 @@ pub enum RpcError {
     /// The request may have reached the wallet but no answer arrived (timeout, dropped
     /// connection). For a submission the outcome is unknown.
     NoAnswer(String),
+    /// An HTTP 5xx with no JSON-RPC body: the wallet (or a proxy in front of it) is overloaded
+    /// or restarting. For a submission the outcome is unknown.
+    Busy(String),
     /// The wallet answered with something that is not a JSON-RPC response.
     Protocol(String),
 }
@@ -39,9 +46,22 @@ impl RpcError {
         }
     }
 
-    /// True when the wallet could not be reached or did not answer: a reason to skip the cycle.
-    pub fn is_connectivity(&self) -> bool {
-        matches!(self, RpcError::Unreachable(_) | RpcError::NoAnswer(_))
+    /// True when the wallet is unreachable, silent, busy or still starting: a reason to skip
+    /// the cycle and try again later, never to refuse.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            RpcError::Unreachable(_) | RpcError::NoAnswer(_) | RpcError::Busy(_)
+        ) || self.code() == Some(RPC_IN_WARMUP)
+    }
+
+    /// For a submission: true when the wallet may have acted on it even though no usable answer
+    /// came back. Such a call must be settled by looking at the wallet, never resent.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            RpcError::NoAnswer(_) | RpcError::Busy(_) | RpcError::Protocol(_)
+        )
     }
 }
 
@@ -56,6 +76,7 @@ impl fmt::Display for RpcError {
             RpcError::Rpc { code, message } => write!(f, "wallet error {code}: {message}"),
             RpcError::Unreachable(e) => write!(f, "wallet RPC unreachable: {e}"),
             RpcError::NoAnswer(e) => write!(f, "no answer from the wallet RPC: {e}"),
+            RpcError::Busy(e) => write!(f, "the wallet RPC is busy or restarting: {e}"),
             RpcError::Protocol(e) => write!(f, "unexpected wallet RPC response: {e}"),
         }
     }
@@ -67,7 +88,9 @@ pub struct Rpc {
     read_agent: ureq::Agent,
     submit_agent: ureq::Agent,
     url: String,
-    auth_header: String,
+    auth_header: Mutex<String>,
+    /// Re-read after a 401/403: zcashd writes a new cookie each time it starts.
+    cookie_file: Option<PathBuf>,
     read_retries: u32,
     next_id: AtomicU64,
     calls: AtomicU64,
@@ -77,12 +100,11 @@ impl Rpc {
     pub fn new(
         url: &str,
         credentials: &Credentials,
+        cookie_file: Option<PathBuf>,
         read_timeout: Duration,
         submit_timeout: Duration,
         read_retries: u32,
     ) -> Rpc {
-        let token = base64::engine::general_purpose::STANDARD
-            .encode(format!("{}:{}", credentials.user, credentials.password));
         let agent = |timeout| {
             ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(5).min(timeout))
@@ -93,7 +115,8 @@ impl Rpc {
             read_agent: agent(read_timeout),
             submit_agent: agent(submit_timeout),
             url: url.to_owned(),
-            auth_header: format!("Basic {token}"),
+            auth_header: Mutex::new(basic_auth(credentials)),
+            cookie_file,
             read_retries,
             next_id: AtomicU64::new(1),
             calls: AtomicU64::new(0),
@@ -111,7 +134,7 @@ impl Rpc {
         let mut attempt = 0;
         loop {
             match self.call(&self.read_agent, method, &params) {
-                Err(e) if e.is_connectivity() && attempt < self.read_retries => {
+                Err(e) if e.is_transient() && attempt < self.read_retries => {
                     let delay = Duration::from_millis(250 << attempt.min(4));
                     log::debug!("rpc retry method={method} attempt={attempt} err={e}");
                     std::thread::sleep(delay);
@@ -128,12 +151,53 @@ impl Rpc {
     }
 
     fn call(&self, agent: &ureq::Agent, method: &str, params: &Value) -> Result<Value, RpcError> {
+        match self.call_once(agent, method, params) {
+            // The wallet refused the request before acting on it, so one retry with a freshly
+            // read cookie is safe even for a submission.
+            Err(RpcError::Auth(status)) if self.reload_cookie() => {
+                log::info!("event=rpc_cookie_reloaded after_status={status}");
+                self.call_once(agent, method, params)
+            }
+            other => other,
+        }
+    }
+
+    fn reload_cookie(&self) -> bool {
+        let Some(path) = &self.cookie_file else {
+            return false;
+        };
+        match crate::config::read_cookie(path) {
+            Ok(c) => {
+                let fresh = basic_auth(&c);
+                let mut header = self.auth_header.lock().expect("no panics while held");
+                let changed = *header != fresh;
+                *header = fresh;
+                changed
+            }
+            Err(e) => {
+                log::warn!("event=rpc_cookie_unreadable err={e:#}");
+                false
+            }
+        }
+    }
+
+    fn call_once(
+        &self,
+        agent: &ureq::Agent,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.calls.fetch_add(1, Ordering::Relaxed);
         let body = json!({"jsonrpc": "1.0", "id": id, "method": method, "params": params});
+        let auth = self
+            .auth_header
+            .lock()
+            .expect("no panics while held")
+            .clone();
         let response = agent
             .post(&self.url)
-            .set("Authorization", &self.auth_header)
+            .set("Authorization", &auth)
             .set("Content-Type", "application/json")
             .send_json(body);
         let text = match response {
@@ -147,7 +211,12 @@ impl Rpc {
             Err(ureq::Error::Status(status, r)) => {
                 let text = r.into_string().unwrap_or_default();
                 return Err(parse_error_body(&text).unwrap_or_else(|| {
-                    RpcError::Protocol(format!("{method}: HTTP {status}: {}", snippet(&text)))
+                    let detail = format!("{method}: HTTP {status}: {}", snippet(&text));
+                    if status >= 500 {
+                        RpcError::Busy(detail)
+                    } else {
+                        RpcError::Protocol(detail)
+                    }
                 }));
             }
             Err(ureq::Error::Transport(t)) => {
@@ -172,6 +241,12 @@ impl Rpc {
             ))),
         }
     }
+}
+
+fn basic_auth(c: &Credentials) -> String {
+    let token =
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", c.user, c.password));
+    format!("Basic {token}")
 }
 
 fn parse_error_body(text: &str) -> Option<RpcError> {
