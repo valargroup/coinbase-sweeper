@@ -1,0 +1,26 @@
+[package]
+name = "coinbase-sweeper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Sweeps a mining pool's transparent coinbase into Ironwood and refills its payout wallet"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+# arbitrary_precision keeps ZEC amounts as exact decimal text, so no amount passes through f64.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+toml = "0.8"
+# Plain HTTP only: the wallet RPC is expected on localhost or a private network.
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process"] }
+zecd-regtest-harness = { git = "https://github.com/p0mvn/zecd", branch = "roman/mac/claude/pool-rpc-compat" }
