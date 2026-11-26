@@ -2,10 +2,10 @@
 //! one configured payout destination, within per-transfer and per-day caps.
 //!
 //! Crash safety rests on the state file. Before every send the tool records the transfer as in
-//! flight and adds it to the day's total, then sends. On the next start an in-flight record is
-//! settled (sent or not sent) from the wallet before anything else is sent; if it cannot be
-//! settled, nothing is sent until an operator resolves it with `--resolve-interrupted`. A crash
-//! can therefore only under-send.
+//! flight, with the source's unspent notes at that moment, and adds it to the day's total; then
+//! it sends. An in-flight record is settled (sent or not sent) from the wallet before anything
+//! else is sent; if it cannot be settled, nothing is sent until an operator resolves it with
+//! `--resolve-interrupted`. A crash can therefore only under-send.
 
 pub mod decide;
 pub mod recover;
@@ -13,7 +13,7 @@ pub mod recover;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -46,9 +46,21 @@ pub struct InFlight {
     pub opid: Option<String>,
     /// The wallet's operation ids just before sending, to recognise a new one after a crash.
     pub ops_before: BTreeSet<String>,
-    /// The wallet's `uptime` just before sending, to tell whether it restarted since.
+    /// The source's unspent notes just before sending (`txid:pool:index`). If every one of them
+    /// is still unspent, the transfer did not happen. `None` when the wallet could not list them.
     #[serde(default)]
-    pub wallet_uptime: Option<u64>,
+    pub notes_before: Option<BTreeSet<String>>,
+    /// The previous refill's txid, so recovery never mistakes it for this one.
+    #[serde(default)]
+    pub previous_txid: Option<String>,
+}
+
+/// A transfer that happened and has not yet passed its check.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingCheck {
+    pub txid: String,
+    pub amount: Zat,
+    pub destination: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,14 +69,19 @@ pub struct RefillState {
     pub day: u64,
     pub sent_today: Zat,
     pub in_flight: Option<InFlight>,
+    #[serde(default)]
+    pub pending_check: Option<PendingCheck>,
     /// The last transfer, until it has `wait_confirmations` confirmations.
     pub unconfirmed: Option<String>,
+    #[serde(default)]
+    pub last_txid: Option<String>,
 }
 
 impl RefillState {
-    /// Starts a new day's total when the UTC day has changed.
+    /// Starts a new day's total when the UTC day moves forward. A clock that steps backwards
+    /// never resets the total.
     pub fn roll_over(&mut self, today: u64) {
-        if self.day != today {
+        if today > self.day {
             self.day = today;
             self.sent_today = Zat::ZERO;
         }
@@ -96,18 +113,18 @@ pub struct Refill {
     transparent_destination: bool,
 }
 
+fn load_state(ctx: &Ctx) -> Result<RefillState> {
+    let mut s: RefillState = ctx.state.read_json("state")?.unwrap_or_default();
+    s.roll_over(utc_day(now_unix()));
+    Ok(s)
+}
+
 impl Refill {
     pub fn new(cfg: RefillConfig) -> Refill {
         Refill {
             cfg,
             transparent_destination: false,
         }
-    }
-
-    fn load(&self, ctx: &Ctx) -> Result<RefillState, CycleError> {
-        let mut s: RefillState = ctx.state.read_json("state")?.unwrap_or_default();
-        s.roll_over(utc_day(now_unix()));
-        Ok(s)
     }
 
     fn save(&self, ctx: &Ctx, s: &RefillState) -> Result<(), CycleError> {
@@ -177,10 +194,13 @@ impl Job for Refill {
     }
 
     fn cycle(&mut self, ctx: &Ctx, chain: &ChainStatus) -> Result<(), CycleError> {
-        let mut state = self.load(ctx)?;
+        let mut state = load_state(ctx)?;
         if !ctx.dry_run {
             if state.in_flight.is_some() {
                 self.settle_in_flight(ctx, &mut state)?;
+            }
+            if let Some(p) = state.pending_check.clone() {
+                self.check(ctx, &mut state, &p)?;
             }
             if let Some(txid) = state.unconfirmed.clone() {
                 self.wait_unconfirmed(ctx, chain, &mut state, &txid)?;
@@ -194,8 +214,9 @@ impl Job for Refill {
             RefillMode::TopUp => Some(self.destination_balance(ctx)?),
             RefillMode::DrainAbove => None,
         };
-        let decision = decide(&self.cfg, spendable, dest_balance, state.sent_today);
-        let amount = match decision {
+        // The waits above can cross UTC midnight: charge the transfer to the day it is sent.
+        state.roll_over(utc_day(now_unix()));
+        let amount = match decide(&self.cfg, spendable, dest_balance, state.sent_today) {
             Decision::Skip(reason) => {
                 log::info!(
                     "event=refill_skip cmd=refill addr={} source_spendable={spendable} \
@@ -243,7 +264,7 @@ impl Refill {
         let dest = self.cfg.destination.clone();
         let wallet = ctx.wallet();
         let ops_before: BTreeSet<String> = wallet.operation_ids()?.into_iter().collect();
-        let wallet_uptime = recover::wallet_uptime(ctx)?;
+        let notes_before = recover::source_notes(ctx)?;
         // Record first, send second: a crash from here on leaves an in-flight record that must
         // be settled before anything else is sent.
         state.sent_today = state
@@ -257,7 +278,8 @@ impl Refill {
             destination: dest.clone(),
             opid: None,
             ops_before,
-            wallet_uptime,
+            notes_before,
+            previous_txid: state.last_txid.clone(),
         });
         self.save(ctx, state)?;
         log::info!(
@@ -284,7 +306,7 @@ impl Refill {
                 return self.settle_in_flight(ctx, state);
             }
             Err(e) => {
-                // A definite refusal: nothing was sent.
+                // A definite refusal before any operation existed: nothing was sent.
                 self.not_sent(ctx, state)?;
                 if e.code() == Some(RPC_WALLET_INSUFFICIENT_FUNDS) {
                     log::warn!(
@@ -301,36 +323,52 @@ impl Refill {
         }
         self.save(ctx, state)?;
         log::info!("event=refill_submitted cmd=refill addr={dest} amount={amount} opid={opid}");
-        match wallet.wait_operation(&opid, op_timeout(ctx), true)? {
-            Some(OpState::Success { txid }) => self.sent(ctx, state, &txid, "ok"),
-            Some(OpState::Failed { code, message }) => {
+        // The result is cleared from the wallet only after the outcome is saved.
+        match wallet.wait_operation(&opid, op_timeout(ctx), false)? {
+            Some(OpState::Success { txid }) => {
+                self.sent(ctx, state, &txid, "ok")?;
+                wallet.clear_operation(&opid);
+                Ok(())
+            }
+            Some(OpState::Failed { code, message }) if code == RPC_WALLET_INSUFFICIENT_FUNDS => {
+                // The wallet could not fund it, so it built nothing. Not retried with a smaller
+                // amount in this cycle.
                 self.not_sent(ctx, state)?;
+                wallet.clear_operation(&opid);
+                log::warn!(
+                    "event=refill_skip cmd=refill addr={dest} amount={amount} opid={opid} \
+                     reason=insufficient_funds detail={message:?}"
+                );
+                Ok(())
+            }
+            Some(OpState::Failed { code, message }) => {
+                // A wallet may keep (and rebroadcast) a transaction the node refused, so a
+                // failure is settled like an interrupted send: by whether the notes were spent.
+                log::error!(
+                    "event=refill_failed cmd=refill addr={dest} amount={amount} opid={opid} \
+                     code={code} reason={message:?}"
+                );
+                self.settle_in_flight(ctx, state)?;
+                wallet.clear_operation(&opid);
                 if is_node_rejection(code, &message) {
-                    log::error!(
-                        "event=refill_failed cmd=refill addr={dest} amount={amount} opid={opid} \
-                         code={code} reason={message:?} outcome=rejected"
-                    );
                     return Err(CycleError::Rejected(message));
-                }
-                if code == RPC_WALLET_INSUFFICIENT_FUNDS {
-                    // Not retried with a smaller amount in this cycle.
-                    log::warn!(
-                        "event=refill_skip cmd=refill addr={dest} amount={amount} opid={opid} \
-                         reason=insufficient_funds detail={message:?}"
-                    );
-                    return Ok(());
                 }
                 Err(CycleError::Failed(anyhow!(
                     "refill operation {opid} failed ({code}): {message}"
                 )))
             }
             Some(other) => {
-                self.not_sent(ctx, state)?;
+                log::error!(
+                    "event=refill_failed cmd=refill addr={dest} amount={amount} opid={opid} \
+                     state={other:?}"
+                );
+                self.settle_in_flight(ctx, state)?;
+                wallet.clear_operation(&opid);
                 Err(CycleError::Failed(anyhow!(
                     "refill operation {opid} ended as {other:?}"
                 )))
             }
-            // The wallet restarted: settle from its history next cycle.
+            // The wallet restarted: settle from its notes and history next cycle.
             None => Err(CycleError::Failed(anyhow!(
                 "the wallet lost refill operation {opid}; it will be settled before any new send"
             ))),
@@ -345,14 +383,24 @@ impl Refill {
             .clone()
             .expect("called only with an in-flight record");
         match recover::settle(ctx, &f, op_timeout(ctx))? {
-            Settled::Sent(txid) => self.sent(ctx, state, &txid, "ok_recovered"),
-            Settled::NotSent(why) => {
+            Settled::Sent { txid, opid } => {
+                self.sent(ctx, state, &txid, "ok_recovered")?;
+                if let Some(opid) = opid {
+                    ctx.wallet().clear_operation(&opid);
+                }
+                Ok(())
+            }
+            Settled::NotSent { why, opid } => {
                 log::warn!(
                     "event=refill_not_sent cmd=refill addr={} amount={} reason={why:?}",
                     f.destination,
                     f.amount
                 );
-                self.not_sent(ctx, state)
+                self.not_sent(ctx, state)?;
+                if let Some(opid) = opid {
+                    ctx.wallet().clear_operation(&opid);
+                }
+                Ok(())
             }
             Settled::Wait(why) => {
                 log::warn!(
@@ -390,7 +438,7 @@ impl Refill {
         self.save(ctx, state)
     }
 
-    /// The in-flight transfer happened as `txid`: check it, then wait for it to confirm.
+    /// The in-flight transfer happened as `txid`: record it, then check it.
     fn sent(
         &self,
         ctx: &Ctx,
@@ -402,7 +450,14 @@ impl Refill {
             .in_flight
             .take()
             .expect("called only with an in-flight record");
+        let pending = PendingCheck {
+            txid: txid.to_owned(),
+            amount: f.amount,
+            destination: f.destination.clone(),
+        };
+        state.pending_check = Some(pending.clone());
         state.unconfirmed = Some(txid.to_owned());
+        state.last_txid = Some(txid.to_owned());
         self.save(ctx, state)?;
         log::info!(
             "event=refilled cmd=refill addr={} amount={} txid={txid} sent_today={} \
@@ -411,27 +466,40 @@ impl Refill {
             f.amount,
             state.sent_today
         );
-        let tx = match ctx.wallet().transaction(txid) {
+        self.check(ctx, state, &pending)
+    }
+
+    /// Checks a transfer. Until it passes, nothing else is sent; a failed check halts.
+    fn check(
+        &self,
+        ctx: &Ctx,
+        state: &mut RefillState,
+        p: &PendingCheck,
+    ) -> Result<(), CycleError> {
+        let tx = match ctx.wallet().transaction(&p.txid) {
             Ok(tx) => tx,
             Err(e) if e.is_transient() => return Err(e.into()),
             Err(e) => {
                 return Err(CycleError::Halt(format!(
-                    "refill {txid} cannot be fetched to check it ({e}); verify it by hand"
+                    "refill {} cannot be fetched to check it ({e}); verify it by hand",
+                    p.txid
                 )))
             }
         };
         if let Err(e) = txcheck::check_refill(
             &tx,
-            &f.destination,
+            &p.destination,
             self.transparent_destination,
-            f.amount,
+            p.amount,
             self.cfg.fee_headroom,
         ) {
             return Err(CycleError::Halt(format!(
-                "refill {txid} failed its check: {e:#}"
+                "refill {} failed its check: {e:#}",
+                p.txid
             )));
         }
-        Ok(())
+        state.pending_check = None;
+        self.save(ctx, state)
     }
 
     /// Waits until the last transfer has `wait_confirmations` confirmations.
@@ -462,22 +530,37 @@ impl Refill {
 }
 
 /// `refill --resolve-interrupted`: the operator's verdict on a transfer the tool could not
-/// settle by itself.
+/// settle by itself. The automatic settling runs first; a verdict the wallet's evidence
+/// contradicts is refused.
 pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
     let run = || -> Result<()> {
-        let mut state: RefillState = ctx.state.read_json("state")?.unwrap_or_default();
-        state.roll_over(utc_day(now_unix()));
+        let mut state = load_state(ctx)?;
         let f = state
             .in_flight
-            .take()
+            .clone()
             .context("there is no interrupted refill to resolve")?;
+        let evidence = recover::settle(ctx, &f, op_timeout(ctx))
+            .map_err(|e| anyhow!("cannot read the wallet to check the verdict: {e:?}"))?;
+        match (&evidence, resolution) {
+            (Settled::Sent { txid, .. }, Resolution::NotSent) => bail!(
+                "the wallet shows this transfer was sent as {txid}; refusing not-sent. Run the \
+                 service normally and it will record it"
+            ),
+            (Settled::NotSent { why, .. }, Resolution::Sent) => bail!(
+                "the wallet shows this transfer was not sent ({why}); refusing sent. Run the \
+                 service normally and it will settle it"
+            ),
+            (Settled::Wait(why), _) => bail!("too early to resolve: {why}"),
+            _ => {}
+        }
+        state.in_flight = None;
         if resolution == Resolution::NotSent {
             state.refund(&f);
         }
         ctx.state.write_json("state", &state)?;
         log::warn!(
             "event=refill_resolved cmd=refill addr={} amount={} resolution={resolution:?} \
-             sent_today={}",
+             evidence={evidence:?} sent_today={}",
             f.destination,
             f.amount,
             state.sent_today
@@ -496,8 +579,7 @@ pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
 /// Lines for `--check`.
 pub fn check_lines(ctx: &Ctx) -> Result<Vec<String>> {
     let cfg = ctx.cfg.refill.as_ref().expect("validated");
-    let mut state: RefillState = ctx.state.read_json("state")?.unwrap_or_default();
-    state.roll_over(utc_day(now_unix()));
+    let state = load_state(ctx)?;
     let mut lines = vec![format!(
         "refill today: sent={} max_per_day={} max_per_transfer={} mode={:?} destination={}",
         state.sent_today, cfg.max_per_day, cfg.max_per_transfer, cfg.mode, cfg.destination
@@ -514,6 +596,9 @@ pub fn check_lines(ctx: &Ctx) -> Result<Vec<String>> {
             "INTERRUPTED refill: amount={} destination={} started_unix={} opid={:?}",
             f.amount, f.destination, f.started_unix, f.opid
         ));
+    }
+    if let Some(p) = &state.pending_check {
+        lines.push(format!("refill awaiting its check: txid={}", p.txid));
     }
     if let Some(t) = &state.unconfirmed {
         lines.push(format!("refill awaiting confirmations: txid={t}"));
@@ -533,6 +618,19 @@ fn confirm_timeout(ctx: &Ctx) -> Duration {
 mod tests {
     use super::*;
 
+    fn in_flight(day: u64) -> InFlight {
+        InFlight {
+            started_unix: 0,
+            day,
+            amount: Zat(200),
+            destination: "t".into(),
+            opid: None,
+            ops_before: BTreeSet::new(),
+            notes_before: None,
+            previous_txid: None,
+        }
+    }
+
     #[test]
     fn roll_over_and_refund() {
         let mut s = RefillState {
@@ -542,22 +640,24 @@ mod tests {
         };
         s.roll_over(10);
         assert_eq!(s.sent_today, Zat(500));
-        let f = InFlight {
-            started_unix: 0,
-            day: 10,
-            amount: Zat(200),
-            destination: "t".into(),
-            opid: None,
-            ops_before: BTreeSet::new(),
-            wallet_uptime: None,
-        };
-        s.refund(&f);
+        s.refund(&in_flight(10));
         assert_eq!(s.sent_today, Zat(300));
         s.roll_over(11);
         assert_eq!(s.sent_today, Zat::ZERO);
         // Yesterday's transfer is not refunded against today's total.
         s.sent_today = Zat(100);
-        s.refund(&f);
+        s.refund(&in_flight(10));
         assert_eq!(s.sent_today, Zat(100));
+    }
+
+    #[test]
+    fn a_clock_stepping_back_never_resets_the_day() {
+        let mut s = RefillState {
+            day: 10,
+            sent_today: Zat(500),
+            ..Default::default()
+        };
+        s.roll_over(9);
+        assert_eq!((s.day, s.sent_today), (10, Zat(500)));
     }
 }

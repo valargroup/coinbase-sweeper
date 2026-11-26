@@ -69,8 +69,7 @@ fn timed_out_send_is_not_resent_and_stays_unsettled() {
             Box::new(Reply::Ok(json!("opid-late"))),
         )
     });
-    // The wallet restarted meanwhile and forgot its operations; its history shows nothing.
-    f.on("uptime", |_| Reply::Ok(json!(1)));
+    // The wallet never lists an operation for it, and its history shows nothing.
     let dir = tempfile::tempdir().unwrap();
     let cfg = refill_config(dir.path(), &f.url);
     let (code, err) = run(&cfg, &["--once"]);
@@ -88,7 +87,7 @@ fn interrupted_refill_settled_by_its_operation() {
     let f = healthy_refill_wallet("100", "24");
     f.on("z_listoperationids", |_| Reply::Ok(json!(["opid-old"])));
     let dir = tempfile::tempdir().unwrap();
-    interrupted_state(dir.path(), Some("opid-old"), 100, 30);
+    interrupted_state(dir.path(), Some("opid-old"), true, 30);
     f.on("getrawtransaction", |_| {
         Reply::Ok(v6_refill_tx(DEST, 2_000_000_000))
     });
@@ -104,7 +103,6 @@ fn interrupted_refill_settled_by_its_operation() {
 #[test]
 fn interrupted_refill_settled_by_wallet_history() {
     let f = healthy_refill_wallet("100", "24");
-    f.on("uptime", |_| Reply::Ok(json!(3)));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -119,7 +117,7 @@ fn interrupted_refill_settled_by_wallet_history() {
         Reply::Ok(v6_refill_tx(DEST, 2_000_000_000))
     });
     let dir = tempfile::tempdir().unwrap();
-    interrupted_state(dir.path(), None, 100, 30);
+    interrupted_state(dir.path(), None, true, 30);
     let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("txid=histtx"), "{err}");
@@ -128,10 +126,11 @@ fn interrupted_refill_settled_by_wallet_history() {
 
 #[test]
 fn interrupted_refill_that_cannot_be_settled_sends_nothing() {
+    // The note the source held before the send is gone, but nothing shows where it went.
     let f = healthy_refill_wallet("100", "4");
-    f.on("uptime", |_| Reply::Ok(json!(3)));
+    f.on("z_listunspent", |_| Reply::Ok(json!([])));
     let dir = tempfile::tempdir().unwrap();
-    interrupted_state(dir.path(), None, 100, 1000);
+    interrupted_state(dir.path(), None, true, 1000);
     let cfg = refill_config(dir.path(), &f.url);
     let (code, err) = run(&cfg, &["--once"]);
     assert_eq!(code, 2, "{err}");
@@ -156,11 +155,11 @@ fn interrupted_refill_that_cannot_be_settled_sends_nothing() {
 
 #[test]
 fn interrupted_refill_provably_not_sent_is_refunded_then_sent_once() {
-    // The wallet kept running (uptime grew), lists no such operation, and its history of the
-    // owned destination shows no such transfer: the send never reached it.
+    // Ten minutes on, no operation, no history entry, and the note the source held before the
+    // send is still unspent: no funds moved.
     let f = healthy_refill_wallet("100", "4");
     let dir = tempfile::tempdir().unwrap();
-    interrupted_state(dir.path(), None, 100, 1000);
+    interrupted_state(dir.path(), None, true, 1000);
     let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("event=refill_not_sent"), "{err}");
@@ -218,7 +217,7 @@ fn a_fresh_interrupted_refill_is_never_settled_as_not_sent() {
     // queued in the wallet, so the tool must wait rather than refund and send again.
     let f = healthy_refill_wallet("100", "4");
     let dir = tempfile::tempdir().unwrap();
-    interrupted_state(dir.path(), None, 100, 30);
+    interrupted_state(dir.path(), None, true, 30);
     let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("event=refill_settling"), "{err}");
@@ -247,4 +246,84 @@ fn coinbase_at_the_destination_does_not_count_as_payable() {
         f.params("z_sendmany")[0][1][0]["amount"].to_string(),
         "21.00000000"
     );
+}
+
+#[test]
+fn a_failed_operation_is_refunded_only_when_no_note_was_spent() {
+    let failed = |p: &Value| {
+        let id = p[0][0].as_str().unwrap_or("x").to_owned();
+        Reply::Ok(json!([{"id": id, "status": "failed",
+                          "error": {"code": -4, "message": "commit failed"}}]))
+    };
+    // Notes untouched: settled as not sent and refunded.
+    let f = healthy_refill_wallet("100", "4");
+    f.on("z_getoperationstatus", failed);
+    let dir = tempfile::tempdir().unwrap();
+    let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=refill_not_sent"), "{err}");
+    assert_eq!(state(dir.path())["sent_today"], json!(0));
+
+    // The note was spent: the wallet may have kept the transaction. Not refunded, not resent.
+    let f = healthy_refill_wallet("100", "4");
+    f.on("z_getoperationstatus", failed);
+    let spent = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let s2 = spent.clone();
+    f.on("z_listunspent", move |_| {
+        if *s2.lock().unwrap() {
+            Reply::Ok(json!([]))
+        } else {
+            Reply::Ok(json!([{"txid": "n1", "pool": "ironwood", "outindex": 0}]))
+        }
+    });
+    let s3 = spent.clone();
+    f.on("z_sendmany", move |_| {
+        *s3.lock().unwrap() = true;
+        Reply::Ok(json!("opid-send"))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = refill_config(dir.path(), &f.url);
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=refill_unsettled"), "{err}");
+    assert_eq!(state(dir.path())["sent_today"], json!(2_100_000_000u64));
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert_eq!(f.calls("z_sendmany"), 1, "never resent");
+    // An operator cannot override what the evidence shows.
+    let (code, _) = run(&cfg, &["--resolve-interrupted", "not-sent", "--dry-run"]);
+    assert_eq!(code, 1, "--dry-run with --resolve-interrupted is refused");
+}
+
+#[test]
+fn resolve_refuses_a_verdict_the_wallet_contradicts() {
+    // The operation shows the transfer was sent; "not-sent" must be refused.
+    let f = healthy_refill_wallet("100", "24");
+    f.on("z_listoperationids", |_| Reply::Ok(json!(["opid-old"])));
+    let dir = tempfile::tempdir().unwrap();
+    interrupted_state(dir.path(), Some("opid-old"), true, 30);
+    let cfg = refill_config(dir.path(), &f.url);
+    let (code, err) = run(&cfg, &["--resolve-interrupted", "not-sent"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("refusing not-sent"), "{err}");
+    assert!(state(dir.path())["in_flight"].is_object());
+}
+
+#[test]
+fn a_backwards_clock_cannot_reset_the_daily_total() {
+    let f = healthy_refill_wallet("100", "4");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    // A total recorded for a day far in the future (the clock later stepped back).
+    std::fs::write(
+        dir.path().join("state/refill.state"),
+        json!({"day": 99_999, "sent_today": 9_000_000_000u64, "in_flight": null,
+               "unconfirmed": null})
+        .to_string(),
+    )
+    .unwrap();
+    let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("max_per_day"), "{err}");
+    assert_eq!(f.calls("z_sendmany"), 0);
 }

@@ -304,7 +304,10 @@ pub fn healthy_refill_wallet(spendable: &str, dest_balance: &str) -> FakeRpc {
             Reply::Ok(json!([]))
         }
     });
-    f.on("uptime", |_| Reply::Ok(json!(100_000)));
+    // The pool address holds one note; tests override this to show it spent.
+    f.on("z_listunspent", |_| {
+        Reply::Ok(json!([{"txid": "n1", "pool": "ironwood", "outindex": 0, "amount": 100}]))
+    });
     f.on("listtransactions", |_| Reply::Ok(json!([])));
     let sent = Arc::new(Mutex::new(0u64));
     let s2 = sent.clone();
@@ -371,7 +374,8 @@ max_per_day = 100
 }
 
 /// Writes a refill state file holding an interrupted transfer of 20 ZEC to DEST.
-pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, uptime: u64, age: u64) {
+/// `with_notes`: the record holds the note snapshot taken before the send.
+pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, with_notes: bool, age: u64) {
     let state = dir.join("state");
     std::fs::create_dir_all(&state).unwrap();
     let now = std::time::SystemTime::now()
@@ -388,7 +392,7 @@ pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, uptime: u64,
             "destination": DEST,
             "opid": opid,
             "ops_before": [],
-            "wallet_uptime": uptime
+            "notes_before": if with_notes { json!(["n1:ironwood:0"]) } else { Value::Null }
         },
         "unconfirmed": null
     });

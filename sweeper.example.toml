@@ -1,0 +1,60 @@
+# coinbase-sweeper example configuration.
+# Every key is described in docs/CONFIGURATION.md. Keys marked "required" have no default.
+# This example is setup 1 of docs/POOL_GUIDE.md: coinbase is paid to a transparent address,
+# `sweep` moves it into Ironwood, and `refill` keeps the pool's payout address funded.
+
+# Required. The pool's unified address with an Orchard receiver only. Create it in the wallet:
+#   z_getaddressforaccount <account> '["orchard"]'
+shielded_address = "u1replace-with-your-orchard-only-unified-address"
+
+[rpc]
+# Required. The wallet's JSON-RPC endpoint (zecd, or zcashd with Ironwood support).
+url = "http://127.0.0.1:8232/"
+# The RPC user. The password comes from the SWEEPER_RPC_PASSWORD environment variable;
+# it is never read from this file.
+user = "pool"
+# Or use the wallet's cookie file instead of user + password:
+# cookie_file = "/var/lib/zcashd/.cookie"
+timeout_secs = 30
+submit_timeout_secs = 120
+read_retries = 3
+
+[general]
+state_dir = "/var/lib/coinbase-sweeper"
+interval_secs = 60
+max_tip_lag_blocks = 2
+operation_timeout_secs = 600
+confirmation_timeout_secs = 1800
+skipped_cycles_before_error = 5
+max_backoff_secs = 600
+rejection_pause_secs = 3600
+
+[sweep]
+# Required. The transparent addresses the pool's blocks pay their reward to.
+coinbase_addresses = ["t1replace-with-your-coinbase-address"]
+min_inputs = 10
+max_wait_blocks = 100
+max_inputs = 50
+max_batches_per_cycle = 10
+# Required. Log an error when one address holds more mature, unswept coinbase than this (ZEC).
+alert_unswept_zec = 500
+
+[refill]
+# Required. "top_up" keeps a wallet-owned transparent address between low_water and target.
+mode = "top_up"
+# Required. Where refills go. Here: the pool's own payout address, which this wallet owns.
+destination = "t1replace-with-your-payout-address"
+low_water = 50
+target = 200
+# drain_above mode (setup 2) uses these instead of low_water and target:
+#   mode = "drain_above"
+#   destination = "t1your-payout-wallet-address"
+#   external_destination = "t1your-payout-wallet-address"   # the same address, written twice
+#   reserve = 5
+minconf = 10
+fee_headroom = 0.001
+min_transfer = 0.01
+# Required. Caps, in ZEC.
+max_per_transfer = 250
+max_per_day = 1000
+wait_confirmations = 1

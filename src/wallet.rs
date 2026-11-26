@@ -48,9 +48,16 @@ pub enum TxStatus {
 pub enum OpState {
     Queued,
     Executing,
-    Success { txid: String },
-    Failed { code: i64, message: String },
+    Success {
+        txid: String,
+    },
+    Failed {
+        code: i64,
+        message: String,
+    },
     Cancelled,
+    /// Finished, in a shape the tool does not use.
+    Other(String),
 }
 
 impl OpState {
@@ -215,7 +222,10 @@ impl<'a> Wallet<'a> {
         let v = match self.rpc.read("gettransaction", json!([txid])) {
             Err(RpcError::Rpc { code: -5, .. }) => {
                 return match self.raw_transaction(txid) {
-                    Ok(_) => Ok(TxStatus::Pending),
+                    Ok(tx) => Ok(match tx.get("confirmations").and_then(Value::as_u64) {
+                        Some(c) if c > 0 => TxStatus::Confirmed(c),
+                        _ => TxStatus::Pending,
+                    }),
                     Err(RpcError::Rpc { code: -5, .. }) => Ok(TxStatus::Gone),
                     Err(e) => Err(e),
                 };
@@ -350,12 +360,13 @@ pub fn parse_operations(v: &Value) -> Result<Vec<Operation>> {
             let state = match str_field(o, "status")? {
                 "queued" => OpState::Queued,
                 "executing" => OpState::Executing,
-                "success" => OpState::Success {
-                    txid: o
-                        .pointer("/result/txid")
-                        .and_then(Value::as_str)
-                        .with_context(|| format!("successful operation {id} has no txid"))?
-                        .to_owned(),
+                "success" => match o.pointer("/result/txid").and_then(Value::as_str) {
+                    Some(txid) => OpState::Success {
+                        txid: txid.to_owned(),
+                    },
+                    // Another program's operation may report its result differently; it is
+                    // finished, and for the tool's own operations this is a failure.
+                    None => OpState::Other("success without a txid".into()),
                 },
                 "failed" => OpState::Failed {
                     code: o
@@ -369,7 +380,7 @@ pub fn parse_operations(v: &Value) -> Result<Vec<Operation>> {
                         .to_owned(),
                 },
                 "cancelled" => OpState::Cancelled,
-                other => bail!("operation {id} has unknown status {other:?}"),
+                other => OpState::Other(format!("unknown status {other:?}")),
             };
             Ok(Operation {
                 id,
@@ -403,7 +414,10 @@ mod tests {
             }
         );
         assert!(!ops[2].state.is_finished());
-        assert!(parse_operations(&json!([{"id": "x", "status": "success"}])).is_err());
+        let odd = parse_operations(&json!([{"id": "x", "status": "success"},
+                                           {"id": "y", "status": "weird"}]))
+        .unwrap();
+        assert!(matches!(odd[0].state, OpState::Other(_)) && odd[1].state.is_finished());
     }
 
     #[test]

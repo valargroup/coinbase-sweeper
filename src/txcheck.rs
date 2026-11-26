@@ -64,9 +64,25 @@ fn common(tx: &Value) -> Result<()> {
     Ok(())
 }
 
-/// A coinbase sweep: transparent inputs in, Ironwood notes out, nothing else.
-pub fn check_sweep(tx: &Value) -> Result<()> {
+/// The most a sweep may pay in fees: a 50-input ZIP 317 sweep pays 0.0026 ZEC.
+pub const MAX_SWEEP_FEE: Zat = Zat(1_000_000);
+
+/// A coinbase sweep: transparent inputs in, Ironwood notes out, nothing else. When the wallet
+/// reported how much it was shielding, the fee (that value minus what entered Ironwood) must be
+/// at most `MAX_SWEEP_FEE`.
+pub fn check_sweep(tx: &Value, shielding_value: Option<Zat>) -> Result<()> {
     common(tx)?;
+    if let Some(value) = shielding_value {
+        let into_ironwood = -value_balance_zat(tx, "ironwood")?;
+        // Amounts are below the 21M ZEC supply cap, so they fit i64.
+        let fee = (value.0 as i64).saturating_sub(into_ironwood);
+        ensure!(
+            (0..=MAX_SWEEP_FEE.0 as i64).contains(&fee),
+            "sweep of {value} ZEC put {into_ironwood} zatoshis into Ironwood: fee {fee} \
+             zatoshis is outside 0..={}",
+            MAX_SWEEP_FEE.0
+        );
+    }
     ensure!(
         array(tx, "vout")?.is_empty(),
         "sweep has transparent outputs"
@@ -182,7 +198,12 @@ mod tests {
 
     #[test]
     fn accepts_v6_ironwood_sweep() {
-        check_sweep(&v6_sweep()).unwrap();
+        check_sweep(&v6_sweep(), None).unwrap();
+        check_sweep(&v6_sweep(), Some(Zat(625_260_000))).unwrap();
+        assert!(
+            check_sweep(&v6_sweep(), Some(Zat(700_000_000))).is_err(),
+            "fee too high"
+        );
     }
 
     #[test]
@@ -192,18 +213,18 @@ mod tests {
             "vShieldedSpend": [], "vShieldedOutput": [{"cv": "00"}],
             "orchard": {"actions": [], "valueBalanceZat": 0}
         });
-        let e = check_sweep(&v5).unwrap_err();
+        let e = check_sweep(&v5, None).unwrap_err();
         assert!(e.to_string().contains("version 5"), "{e}");
         let mut sapling_out = v6_sweep();
         sapling_out["vShieldedOutput"] = json!([{"cv": "00"}]);
-        assert!(check_sweep(&sapling_out).is_err());
+        assert!(check_sweep(&sapling_out, None).is_err());
     }
 
     #[test]
     fn rejects_stray_transparent_output() {
         let mut tx = v6_sweep();
         tx["vout"] = json!([{"valueZat": 1, "scriptPubKey": {"addresses": ["tmX"]}}]);
-        assert!(check_sweep(&tx)
+        assert!(check_sweep(&tx, None)
             .unwrap_err()
             .to_string()
             .contains("transparent outputs"));
@@ -252,9 +273,9 @@ mod tests {
     fn missing_fields_fail_closed() {
         let mut tx = v6_sweep();
         tx.as_object_mut().unwrap().remove("vShieldedOutput");
-        assert!(check_sweep(&tx).is_err());
+        assert!(check_sweep(&tx, None).is_err());
         let mut tx = v6_sweep();
         tx["ironwood"] = json!({"valueBalanceZat": 0});
-        assert!(check_sweep(&tx).is_err());
+        assert!(check_sweep(&tx, None).is_err());
     }
 }

@@ -465,3 +465,47 @@ impl Pool {
 pub fn refill_section(body: &str) -> String {
     format!("[refill]\nminconf = 10\nwait_confirmations = 1\nmin_transfer = 0.01\n{body}\n")
 }
+
+/// CPU seconds (user + system) a process has used so far, from /proc.
+pub fn cpu_secs(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // Fields after the parenthesised command name; utime and stime are the 12th and 13th.
+    let rest = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or("");
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ticks: f64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+        + f.get(12).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    ticks / 100.0
+}
+
+/// A `/proc/<pid>/status` field in kB (VmRSS, VmHWM).
+pub fn status_kb(pid: u32, field: &str) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with(field))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The pid of the process whose command line mentions `needle` (the wallet's datadir).
+pub fn pid_of(needle: &str) -> Option<u32> {
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let cmd = String::from_utf8_lossy(&cmd);
+        if cmd.contains(needle) && !cmd.contains("coinbase-sweeper") {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// The "key=value" number from the last log line containing `event`.
+pub fn last_value(log: &str, event: &str, key: &str) -> Option<u64> {
+    log_values(log, event, key)
+        .last()
+        .and_then(|v| v.parse().ok())
+}

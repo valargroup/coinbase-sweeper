@@ -223,20 +223,33 @@ impl Sweep {
             let Some(from) = self.own_sweep_source(ctx, &op) else {
                 continue;
             };
-            wallet.clear_operation(&op.id);
-            match op.state {
+            match &op.state {
                 OpState::Success { txid } => {
                     log::info!(
                         "event=swept cmd=sweep addr={from} txid={txid} opid={} \
                          outcome=ok_recovered",
                         op.id
                     );
-                    self.record_and_check(ctx, &from, &txid)?;
+                    // Recorded before the wallet forgets the operation.
+                    self.record_and_check(ctx, &from, txid)?;
+                    wallet.clear_operation(&op.id);
                 }
-                other => log::warn!(
-                    "event=recovered_op cmd=sweep addr={from} opid={} state={other:?}",
-                    op.id
-                ),
+                OpState::Failed { code, message } if is_node_rejection(*code, message) => {
+                    wallet.clear_operation(&op.id);
+                    log::error!(
+                        "event=sweep_failed cmd=sweep addr={from} opid={} code={code} \
+                         reason={message:?} outcome=rejected_recovered",
+                        op.id
+                    );
+                    return Err(CycleError::Rejected(message.clone()));
+                }
+                other => {
+                    wallet.clear_operation(&op.id);
+                    log::warn!(
+                        "event=recovered_op cmd=sweep addr={from} opid={} state={other:?}",
+                        op.id
+                    );
+                }
             }
         }
         Ok(())
@@ -246,10 +259,23 @@ impl Sweep {
     fn settle_records(&self, ctx: &Ctx, chain: &ChainStatus) -> Result<(), CycleError> {
         let state = self.load(ctx)?;
         for r in state.unconfirmed {
-            if !r.checked {
-                self.check(ctx, &r.address, &r.txid)?;
+            let status = ctx.wallet().tx_status(&r.txid, chain.wallet_height)?;
+            if status == TxStatus::Gone && !r.checked {
+                // Never checked, and now unknown to both wallet and node: it cannot have moved
+                // funds anywhere, but say so loudly.
+                log::error!(
+                    "event=sweep_unchecked_gone cmd=sweep addr={} txid={} note=\"never checked; \
+                     the wallet and node no longer know it\"",
+                    r.address,
+                    r.txid
+                );
+                self.forget(ctx, &r.txid)?;
+                continue;
             }
-            let status = match ctx.wallet().tx_status(&r.txid, chain.wallet_height)? {
+            if !r.checked {
+                self.check(ctx, &r.address, &r.txid, None)?;
+            }
+            let status = match status {
                 TxStatus::Pending => {
                     log::info!(
                         "event=wait_confirmation cmd=sweep txid={} note=previous_sweep",
@@ -285,6 +311,17 @@ impl Sweep {
 
     /// Records a sweep (before anything else can fail) and checks it.
     fn record_and_check(&self, ctx: &Ctx, address: &str, txid: &str) -> Result<(), CycleError> {
+        self.record_and_check_value(ctx, address, txid, None)
+    }
+
+    /// As `record_and_check`, also bounding the fee when the shielded value is known.
+    fn record_and_check_value(
+        &self,
+        ctx: &Ctx,
+        address: &str,
+        txid: &str,
+        value: Option<Zat>,
+    ) -> Result<(), CycleError> {
         let mut state = self.load(ctx)?;
         if !state.unconfirmed.iter().any(|r| r.txid == txid) {
             state.unconfirmed.push(SweepRecord {
@@ -294,12 +331,18 @@ impl Sweep {
             });
             self.save(ctx, &state)?;
         }
-        self.check(ctx, address, txid)
+        self.check(ctx, address, txid, value)
     }
 
     /// Checks a recorded sweep and marks it checked. A transaction that fails the check, or that
     /// can no longer be found to check, halts the command.
-    fn check(&self, ctx: &Ctx, address: &str, txid: &str) -> Result<(), CycleError> {
+    fn check(
+        &self,
+        ctx: &Ctx,
+        address: &str,
+        txid: &str,
+        value: Option<Zat>,
+    ) -> Result<(), CycleError> {
         let tx = match ctx.wallet().transaction(txid) {
             Ok(tx) => tx,
             Err(e) if e.is_transient() => return Err(e.into()),
@@ -310,7 +353,7 @@ impl Sweep {
                 )))
             }
         };
-        if let Err(e) = txcheck::check_sweep(&tx) {
+        if let Err(e) = txcheck::check_sweep(&tx, value) {
             return Err(CycleError::Halt(format!(
                 "sweep {txid} from {address} failed its check: {e:#}"
             )));
@@ -323,6 +366,10 @@ impl Sweep {
     }
 
     fn sweep_batch(&self, ctx: &Ctx, address: &str) -> Result<Batch, CycleError> {
+        // A halt (from the operator or the other command) stops even a long cycle.
+        if let Some(reason) = ctx.state.halted()? {
+            return Err(CycleError::Failed(anyhow!("sending is halted: {reason}")));
+        }
         let wallet = ctx.wallet();
         let ops_before: HashSet<String> = wallet.operation_ids()?.into_iter().collect();
         let params = json!([
@@ -338,19 +385,28 @@ impl Sweep {
                 return Ok(Batch::NothingToShield);
             }
             Err(e) if e.outcome_unknown() => {
-                return Err(self.unknown(ctx, address, &ops_before, e))
+                let txid = self.unknown(ctx, address, &ops_before, e)?;
+                return Ok(Batch::Swept {
+                    txid,
+                    remaining: None,
+                });
             }
             // Unreachable, still warming up, or a definite refusal: the wallet did not act.
             Err(e) => return Err(e.into()),
         };
         let Some(opid) = reply.get("opid").and_then(Value::as_str).map(str::to_owned) else {
             let e = RpcError::Protocol(format!("z_shieldcoinbase returned no opid: {reply}"));
-            return Err(self.unknown(ctx, address, &ops_before, e));
+            let txid = self.unknown(ctx, address, &ops_before, e)?;
+            return Ok(Batch::Swept {
+                txid,
+                remaining: None,
+            });
         };
         let inputs = reply.get("shieldingUTXOs").and_then(Value::as_u64);
-        let value = reply
+        let shielding_value = reply
             .get("shieldingValue")
             .and_then(|v| Zat::from_json(v).ok());
+        let value = shielding_value;
         let remaining = reply.get("remainingUTXOs").and_then(Value::as_u64);
         let shown = |v: Option<String>| v.unwrap_or_else(|| "unknown".into());
         let inputs = shown(inputs.map(|n| n.to_string()));
@@ -360,7 +416,7 @@ impl Sweep {
              remaining_inputs={} opid={opid}",
             shown(remaining.map(|n| n.to_string())),
         );
-        let txid = self.finish_operation(ctx, address, &opid)?;
+        let txid = self.finish_operation(ctx, address, &opid, shielding_value)?;
         log::info!(
             "event=swept cmd=sweep addr={address} inputs={inputs} amount={value} txid={txid} \
              outcome=ok"
@@ -369,8 +425,15 @@ impl Sweep {
     }
 
     /// Waits for a sweep operation, then records and checks its transaction.
-    fn finish_operation(&self, ctx: &Ctx, address: &str, opid: &str) -> Result<String, CycleError> {
-        let state = match ctx.wallet().wait_operation(opid, op_timeout(ctx), true) {
+    fn finish_operation(
+        &self,
+        ctx: &Ctx,
+        address: &str,
+        opid: &str,
+        value: Option<Zat>,
+    ) -> Result<String, CycleError> {
+        // Not cleared yet: the txid must be recorded first.
+        let state = match ctx.wallet().wait_operation(opid, op_timeout(ctx), false) {
             Ok(Some(state)) => state,
             Ok(None) => {
                 self.hold(ctx, opid)?;
@@ -384,6 +447,9 @@ impl Sweep {
                 return Err(e.into());
             }
         };
+        if !matches!(state, OpState::Success { .. }) {
+            ctx.wallet().clear_operation(opid);
+        }
         let txid = match state {
             OpState::Success { txid } => txid,
             OpState::Failed { code, message } if is_node_rejection(code, &message) => {
@@ -404,52 +470,51 @@ impl Sweep {
                 )))
             }
         };
-        self.record_and_check(ctx, address, &txid)?;
+        self.record_and_check_value(ctx, address, &txid, value)?;
+        ctx.wallet().clear_operation(opid);
         Ok(txid)
     }
 
-    /// A submission whose outcome is unknown: settle any sweep of ours that appeared, then end
-    /// the cycle. Never resend.
+    /// A submission whose outcome is unknown. A hold is set first, so even if nothing can be
+    /// settled now, no new sweep starts before the next block. Then any sweep of ours that
+    /// appeared is waited for, recorded and checked, and its txid returned. Never resends.
     fn unknown(
         &self,
         ctx: &Ctx,
         address: &str,
         ops_before: &HashSet<String>,
         e: RpcError,
-    ) -> CycleError {
+    ) -> Result<String, CycleError> {
         log::error!("event=submit_unknown cmd=sweep addr={address} err={e}");
-        let settle = || -> Result<(), CycleError> {
-            let wallet = ctx.wallet();
-            let ids: Vec<String> = wallet
-                .operation_ids()?
-                .into_iter()
-                .filter(|id| !ops_before.contains(id))
-                .collect();
-            let ours: Vec<Operation> = wallet
-                .operations(&ids)?
-                .into_iter()
-                .filter(|op| self.own_sweep_source(ctx, op).as_deref() == Some(address))
-                .collect();
-            if ours.is_empty() {
-                log::warn!("event=submit_unknown_settled cmd=sweep addr={address} new_sweeps=0");
-            }
-            for op in ours {
-                let txid = self.finish_operation(ctx, address, &op.id)?;
-                log::info!(
-                    "event=swept cmd=sweep addr={address} txid={txid} opid={} \
-                     outcome=ok_after_unknown",
-                    op.id
-                );
-            }
-            Ok(())
-        };
-        match settle() {
-            Ok(()) => CycleError::Failed(anyhow!(
-                "the z_shieldcoinbase call for {address} got no usable answer ({e}); not \
-                 resending in this cycle"
-            )),
-            Err(other) => other,
+        self.hold(ctx, "unknown")?;
+        let wallet = ctx.wallet();
+        let ids: Vec<String> = wallet
+            .operation_ids()?
+            .into_iter()
+            .filter(|id| !ops_before.contains(id))
+            .collect();
+        let ours: Vec<Operation> = wallet
+            .operations(&ids)?
+            .into_iter()
+            .filter(|op| self.own_sweep_source(ctx, op).as_deref() == Some(address))
+            .collect();
+        let mut settled = None;
+        for op in ours {
+            let txid = self.finish_operation(ctx, address, &op.id, None)?;
+            log::info!(
+                "event=swept cmd=sweep addr={address} txid={txid} opid={} \
+                 outcome=ok_after_unknown",
+                op.id
+            );
+            settled = Some(txid);
         }
+        settled.ok_or_else(|| {
+            log::warn!("event=submit_unknown_settled cmd=sweep addr={address} new_sweeps=0");
+            CycleError::Failed(anyhow!(
+                "the z_shieldcoinbase call for {address} got no usable answer ({e}); not \
+                 resending; new sweeps wait for the next block"
+            ))
+        })
     }
 }
 

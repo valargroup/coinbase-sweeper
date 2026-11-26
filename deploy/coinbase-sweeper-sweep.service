@@ -1,0 +1,37 @@
+# Runs `coinbase-sweeper sweep` as a service. See docs/POOL_GUIDE.md, step 9.
+#
+# Install:
+#   sudo install -m 0755 target/release/coinbase-sweeper /usr/local/bin/
+#   sudo install -d -m 0750 /etc/coinbase-sweeper
+#   sudo install -m 0640 sweeper.toml /etc/coinbase-sweeper/sweeper.toml
+#   echo 'SWEEPER_RPC_PASSWORD=...' | sudo tee /etc/coinbase-sweeper/env; sudo chmod 0600 /etc/coinbase-sweeper/env
+#   sudo cp deploy/coinbase-sweeper-sweep.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now coinbase-sweeper-sweep
+
+[Unit]
+Description=coinbase-sweeper: shield transparent coinbase into Ironwood
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/coinbase-sweeper sweep --config /etc/coinbase-sweeper/sweeper.toml
+# SWEEPER_RPC_PASSWORD, unless the config uses rpc.cookie_file.
+EnvironmentFile=-/etc/coinbase-sweeper/env
+# Matches general.state_dir in the example config.
+StateDirectory=coinbase-sweeper
+# Exit 2 (a failed cycle, or a halt) restarts after a pause. Exit 1 means startup was refused
+# (configuration, address ownership, a second instance, or a halt marker): restarting would not
+# help, so systemd leaves the service stopped for an operator to look at.
+Restart=on-failure
+RestartSec=60
+RestartPreventExitStatus=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/coinbase-sweeper
+PrivateTmp=true
+# If rpc.cookie_file is under /home, remove this line.
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
