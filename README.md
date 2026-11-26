@@ -140,14 +140,26 @@ the regtest harness from the zecd repository as a test dependency.
 | One 50-input sweep, call to success | 0.62 s; wallet CPU 1.6 s for the whole run | well under 25 s; flag above 10 s: **met** |
 | Backlog: 1,023 rewards, one block mined per batch | 21 batches in 44.4 s = 83,000 rewards per hour. On mainnet a batch waits for a block: 50 per 25 s block = 7,200 per hour | at least 1,440 per hour: **met** (5× at mainnet block times) |
 | Idle cycle (nothing due) | 5 RPC calls, 90 ms; 0.3 s for a whole `--once` process | a few calls, under 1 s: **met** |
-| The tool's footprint | SOAK_FOOTPRINT | negligible next to the wallet: **met** |
+| The tool's footprint | Over a 30-minute soak: peak memory 4.3 MB per process; CPU 0.7 s (sweep) and 0.6 s (refill) in total | negligible next to the wallet: **met** |
 | Scale | 50,000 `listunspent` entries parsed in 0.17 s; planning over 200,000 entries is linear (unit tests) | no quadratic work: **met** |
 
 No target was missed.
 
 ### Soak (zecd, both commands as services)
 
-SOAK_RESULT
+Both commands ran as services against one zecd wallet for 30 minutes while a block was mined
+every 4 seconds (450 blocks), with sweeps (`min_inputs = 10`) and refills (`drain_above` to an
+external address) running alongside each other.
+
+- No ERROR lines in either log (sweep: 869 cycles; refill: 864 cycles).
+- 482 rewards swept in 46 sweeps; every one spent exactly once (checked on the node). The 109
+  left unswept were immature, or fewer than `min_inputs` at the end.
+- 51 refills paid 877.47 ZEC.
+- The books balance from the chain: coinbase swept (916.67830982 ZEC) minus sweep fees
+  (0.0287 ZEC) minus refill fees (0.00805 ZEC) equals the Ironwood balance (39.1666317 ZEC) plus
+  everything refilled, to within 10,000 zatoshis. That remainder is two refill change notes of
+  at most 5,000 zatoshis each. A note that small costs as much to spend as it holds, so the
+  wallet leaves it out of its balance; nothing is lost.
 
 ### Documentation reader test
 
