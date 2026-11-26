@@ -601,10 +601,17 @@ pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
     }
 }
 
-/// `refill --clear-halt`: after an operator has investigated a halt, accepts the transfer whose
-/// check failed (it is not checked again) and removes the marker.
-pub fn clear_halt(ctx: &Ctx) -> Result<()> {
-    let mut state = load_state(ctx)?;
+/// `refill --clear-halt`: after an operator has investigated a refill halt, accepts the
+/// transfer whose check failed (it is not checked again) and removes the marker. Refuses when
+/// refill is not halted, so a transfer that was never checked cannot be waved through.
+pub fn clear_halt(dir: &crate::state::StateDir) -> Result<()> {
+    let reason = dir.own_halt()?.ok_or_else(|| {
+        anyhow!(
+            "refill is not halted (no {}); nothing to clear",
+            dir.halt_path().display()
+        )
+    })?;
+    let mut state: RefillState = dir.read_json("state")?.unwrap_or_default();
     if let Some(p) = state.pending_check.take() {
         log::warn!(
             "event=halt_cleared cmd=refill accepted_txid={} amount={}",
@@ -612,9 +619,9 @@ pub fn clear_halt(ctx: &Ctx) -> Result<()> {
             p.amount
         );
     }
-    ctx.state.write_json("state", &state)?;
-    let removed = ctx.state.clear_halt()?;
-    log::warn!("event=halt_cleared cmd=refill marker_removed={removed}");
+    dir.write_json("state", &state)?;
+    dir.clear_halt()?;
+    log::warn!("event=halt_cleared cmd=refill halt_reason={reason:?}");
     Ok(())
 }
 

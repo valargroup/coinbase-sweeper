@@ -393,3 +393,22 @@ fn a_backwards_clock_cannot_reset_the_daily_total() {
     assert!(err.contains("max_per_day"), "{err}");
     assert_eq!(f.calls("z_sendmany"), 0);
 }
+
+#[test]
+fn clear_halt_refuses_when_not_halted() {
+    // A transfer whose check has not run yet (no halt) must not be waved through.
+    let f = healthy_refill_wallet("100", "4");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    std::fs::write(
+        dir.path().join("state/refill.state"),
+        json!({"day": 0, "sent_today": 0, "in_flight": null, "unconfirmed": null,
+               "pending_check": {"txid": "t", "amount": 1, "destination": DEST}})
+        .to_string(),
+    )
+    .unwrap();
+    let (code, err) = run(&refill_config(dir.path(), &f.url), &["--clear-halt"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("not halted"), "{err}");
+    assert!(state(dir.path())["pending_check"].is_object());
+}

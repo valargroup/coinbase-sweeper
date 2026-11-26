@@ -91,6 +91,15 @@ impl StateDir {
         Ok(None)
     }
 
+    /// This command's own halt reason, if this command is halted.
+    pub fn own_halt(&self) -> Result<Option<String>> {
+        match fs::read_to_string(self.halt_path()) {
+            Ok(s) => Ok(Some(s.trim().to_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("cannot read the halt marker"),
+        }
+    }
+
     /// Removes this command's halt marker. Returns whether there was one.
     pub fn clear_halt(&self) -> Result<bool> {
         match fs::remove_file(self.halt_path()) {

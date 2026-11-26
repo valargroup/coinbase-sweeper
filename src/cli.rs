@@ -93,7 +93,35 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         Ok(c) => c,
         Err(e) => return refuse(e),
     };
-    let credentials = match wait_for_credentials(&cfg, cmd, common.once || common.dry_run) {
+    if (resolution.is_some() || common.clear_halt) && (common.dry_run || common.check) {
+        return refuse(anyhow::anyhow!(
+            "--resolve-interrupted and --clear-halt change the state; they cannot be combined \
+             with --dry-run or --check"
+        ));
+    }
+    if resolution.is_some() && common.clear_halt {
+        return refuse(anyhow::anyhow!(
+            "run --resolve-interrupted and --clear-halt separately"
+        ));
+    }
+    let state = match StateDir::new(&cfg.general.state_dir, command) {
+        Ok(s) => s,
+        Err(e) => return refuse(e),
+    };
+    // Clearing a halt touches only local files: no wallet needed, but the lock is.
+    if common.clear_halt {
+        let cleared = state.lock().and_then(|_lock| match command {
+            Command::Sweep => sweep::clear_halt(&state),
+            Command::Refill => refill::clear_halt(&state),
+        });
+        return match cleared {
+            Ok(()) => Exit::Ok,
+            Err(e) => refuse(e),
+        };
+    }
+    // Only a long-running service waits for the wallet's cookie to appear.
+    let one_shot = common.once || common.dry_run || common.check || resolution.is_some();
+    let credentials = match wait_for_credentials(&cfg, cmd, one_shot) {
         Ok(c) => c,
         Err(exit) => return exit,
     };
@@ -105,10 +133,6 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         cfg.submit_timeout(),
         cfg.rpc.read_retries,
     );
-    let state = match StateDir::new(&cfg.general.state_dir, command) {
-        Ok(s) => s,
-        Err(e) => return refuse(e),
-    };
     let ctx = Ctx {
         cfg: &cfg,
         rpc: &rpc,
@@ -116,12 +140,6 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         dry_run: common.dry_run,
     };
 
-    if (resolution.is_some() || common.clear_halt) && (common.dry_run || common.check) {
-        return refuse(anyhow::anyhow!(
-            "--resolve-interrupted and --clear-halt change the state; they cannot be combined \
-             with --dry-run or --check"
-        ));
-    }
     if common.check {
         return check::report(&ctx, command, &mut std::io::stdout());
     }
@@ -139,17 +157,6 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
     if let Some(resolution) = resolution {
         return refill::resolve_interrupted(&ctx, resolution);
     }
-    if common.clear_halt {
-        let cleared = match command {
-            Command::Sweep => sweep::clear_halt(&ctx),
-            Command::Refill => refill::clear_halt(&ctx),
-        };
-        return match cleared {
-            Ok(()) => Exit::Ok,
-            Err(e) => refuse(e),
-        };
-    }
-
     let mut job: Box<dyn Job> = match command {
         Command::Sweep => Box::new(sweep::Sweep::new(
             cfg.sweep
@@ -173,11 +180,21 @@ fn wait_for_credentials(
     once: bool,
 ) -> Result<crate::config::Credentials, Exit> {
     let mut delay = std::time::Duration::from_secs(cfg.general.interval_secs);
+    let mut attempts = 0u32;
+    let missing = |p: &std::path::Path| matches!(std::fs::metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     loop {
         match cfg.rpc.credentials(std::env::var(PASSWORD_ENV).ok()) {
             Ok(c) => return Ok(c),
-            Err(e) if cfg.rpc.cookie_file.as_ref().is_some_and(|p| !p.exists()) => {
-                log::warn!("event=startup_waiting cmd={cmd} reason={e:#}");
+            Err(e) if cfg.rpc.cookie_file.as_deref().is_some_and(missing) => {
+                attempts = attempts.saturating_add(1);
+                if attempts >= cfg.general.skipped_cycles_before_error {
+                    log::error!(
+                        "event=startup_waiting cmd={cmd} attempts={attempts} reason={e:#} \
+                         note=\"check rpc.cookie_file if the wallet is running\""
+                    );
+                } else {
+                    log::warn!("event=startup_waiting cmd={cmd} reason={e:#}");
+                }
                 if once {
                     return Err(Exit::Failed);
                 }

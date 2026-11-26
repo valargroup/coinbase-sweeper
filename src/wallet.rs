@@ -460,3 +460,28 @@ mod tests {
         assert!(zcashd.initial_block_download);
     }
 }
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_large_listunspent_in_linear_time() {
+        let entries: Vec<String> = (0..50_000)
+            .map(|i| {
+                format!(
+                    r#"{{"txid":"{i:064x}","vout":0,"address":"tmPool","amount":3.125,"confirmations":{},"generated":true,"pool":"transparent"}}"#,
+                    100 + i
+                )
+            })
+            .collect();
+        let text = format!("[{}]", entries.join(","));
+        let started = std::time::Instant::now();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let utxos = parse_unspent(&v).unwrap();
+        assert_eq!(utxos.len(), 50_000);
+        let elapsed = started.elapsed();
+        eprintln!("parsed 50,000 listunspent entries in {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(5));
+    }
+}

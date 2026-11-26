@@ -162,10 +162,17 @@ impl Job for Sweep {
     }
 }
 
-/// `sweep --clear-halt`: after an operator has investigated a halt, marks every recorded sweep
-/// as checked (so the same transaction does not halt the command again) and removes the marker.
-pub fn clear_halt(ctx: &Ctx) -> anyhow::Result<()> {
-    let mut state: SweepState = ctx.state.read_json("state")?.unwrap_or_default();
+/// `sweep --clear-halt`: after an operator has investigated a sweep halt, marks the recorded
+/// sweeps as checked (so the transaction that halted the command does not halt it again) and
+/// removes the marker. Refuses when sweep is not halted.
+pub fn clear_halt(dir: &crate::state::StateDir) -> anyhow::Result<()> {
+    let reason = dir.own_halt()?.ok_or_else(|| {
+        anyhow!(
+            "sweep is not halted (no {}); nothing to clear",
+            dir.halt_path().display()
+        )
+    })?;
+    let mut state: SweepState = dir.read_json("state")?.unwrap_or_default();
     for r in state.unconfirmed.iter_mut().filter(|r| !r.checked) {
         log::warn!(
             "event=halt_cleared cmd=sweep accepted_txid={} addr={}",
@@ -174,9 +181,9 @@ pub fn clear_halt(ctx: &Ctx) -> anyhow::Result<()> {
         );
         r.checked = true;
     }
-    ctx.state.write_json("state", &state)?;
-    let removed = ctx.state.clear_halt()?;
-    log::warn!("event=halt_cleared cmd=sweep marker_removed={removed}");
+    dir.write_json("state", &state)?;
+    dir.clear_halt()?;
+    log::warn!("event=halt_cleared cmd=sweep halt_reason={reason:?}");
     Ok(())
 }
 

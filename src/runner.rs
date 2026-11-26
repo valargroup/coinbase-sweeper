@@ -136,7 +136,7 @@ fn halt_reason(ctx: &Ctx, cmd: &str) -> Option<String> {
         Ok(Some(reason)) => {
             log::error!(
                 "event=refused cmd={cmd} reason=halted detail={reason:?} fix=\"investigate, then \
-                 delete the marker file\""
+                 run with --clear-halt\""
             );
             Some(reason)
         }
@@ -163,7 +163,7 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
         Duration::from_secs(secs)
     };
 
-    let mut attempts = 0;
+    let mut attempts: u32 = 0;
     loop {
         match job.startup(ctx) {
             Ok(()) => break,
@@ -171,9 +171,17 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
             // (the client re-reads it on every 401): wait rather than refuse.
             Err(StartupError::Refuse(e))
                 if ctx.cfg.rpc.cookie_file.is_some()
-                    && matches!(e.downcast_ref::<RpcError>(), Some(RpcError::Auth(_))) =>
+                    && matches!(e.downcast_ref::<RpcError>(), Some(RpcError::Auth(401))) =>
             {
-                log::warn!("event=startup_waiting cmd={cmd} reason={e:#}");
+                if attempts.saturating_add(1) >= g.skipped_cycles_before_error {
+                    log::error!(
+                        "event=startup_waiting cmd={cmd} attempts={} reason={e:#} \
+                         note=\"the cookie keeps being refused; check rpc.cookie_file\"",
+                        attempts + 1
+                    );
+                } else {
+                    log::warn!("event=startup_waiting cmd={cmd} reason={e:#}");
+                }
                 if once {
                     return Exit::Failed;
                 }
@@ -278,7 +286,8 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
             }
             Err(CycleError::Halt(reason)) => {
                 log::error!(
-                    "event=halted cmd={cmd} reason={reason:?} fix=\"investigate, then delete {}\"",
+                    "event=halted cmd={cmd} reason={reason:?} fix=\"investigate, then run {cmd} \
+                     --clear-halt\" marker={}",
                     ctx.state.halt_path().display()
                 );
                 if let Err(e) = ctx.state.halt(&reason) {

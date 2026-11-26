@@ -277,7 +277,7 @@ check would halt the command again. A halt from either command stops both. Likew
 ## 8. FAQ
 
 **What does it cost in fees?** The wallet pays the standard ZIP 317 fee; the tool never sets
-one. On our test network a 50-input sweep paid 0.0026 ZEC and a refill 0.00015 ZEC.
+one. On our test network a 50-input sweep paid 0.0026 ZEC and a refill 0.00015 to 0.0002 ZEC.
 
 **What do the transactions reveal?** A sweep spends transparent outputs, so their addresses and
 amounts are public, as with any sweep into Sapling today; what happens in Ironwood afterwards is
