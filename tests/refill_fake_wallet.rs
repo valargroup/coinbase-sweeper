@@ -155,16 +155,82 @@ fn interrupted_refill_that_cannot_be_settled_sends_nothing() {
 
 #[test]
 fn interrupted_refill_provably_not_sent_is_refunded_then_sent_once() {
-    // Ten minutes on, no operation, no history entry, and the note the source held before the
-    // send is still unspent: no funds moved.
+    // Ten minutes on, no operation, no history entry, and the note the wallet held before the
+    // send is still unspent: no funds moved. The refund happens now; a new send only on the
+    // next cycle.
     let f = healthy_refill_wallet("100", "4");
     let dir = tempfile::tempdir().unwrap();
     interrupted_state(dir.path(), None, true, 1000);
-    let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
-    assert_eq!(code, 0, "{err}");
+    let cfg = refill_config(dir.path(), &f.url);
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "{err}");
     assert!(err.contains("event=refill_not_sent"), "{err}");
+    assert_eq!(f.calls("z_sendmany"), 0, "{err}");
+    assert_eq!(state(dir.path())["sent_today"], json!(0));
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
     assert_eq!(f.calls("z_sendmany"), 1, "{err}");
     assert_eq!(state(dir.path())["sent_today"], json!(2_100_000_000u64));
+}
+
+#[test]
+fn an_empty_note_snapshot_proves_nothing() {
+    let f = healthy_refill_wallet("100", "4");
+    let dir = tempfile::tempdir().unwrap();
+    interrupted_state(dir.path(), None, true, 1000);
+    // Rewrite the snapshot as empty.
+    let p = dir.path().join("state/refill.state");
+    let text = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("[\"n1:ironwood:0\"]", "[]");
+    std::fs::write(&p, text).unwrap();
+    let (code, err) = run(&refill_config(dir.path(), &f.url), &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=refill_unsettled"), "{err}");
+    assert_eq!(f.calls("z_sendmany"), 0);
+}
+
+#[test]
+fn clear_halt_accepts_the_transfer_and_resumes() {
+    // A refill whose check fails halts both commands.
+    let f = healthy_refill_wallet("100", "4");
+    f.on("getrawtransaction", |_| {
+        Reply::Ok(v6_refill_tx("tmSomeoneElse", 2_100_000_000))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = refill_config(dir.path(), &f.url);
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=halted"), "{err}");
+    let (code, _) = run(&cfg, &["--once"]);
+    assert_eq!(code, 1, "halted");
+    // Deleting the marker alone is not enough: the same check would halt again. --clear-halt
+    // accepts the transfer and removes the marker.
+    let (code, err) = run(&cfg, &["--clear-halt"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("accepted_txid=refilltx"), "{err}");
+    assert_eq!(state(dir.path())["pending_check"], Value::Null);
+    f.on("getrawtransaction", |_| {
+        Reply::Ok(v6_refill_tx(DEST, 2_100_000_000))
+    });
+    let (code, err) = run(&cfg, &["--once"]);
+    assert!(code == 0 || code == 2, "{err}");
+    assert!(!err.contains("reason=halted"), "{err}");
+}
+
+#[test]
+fn a_missing_cookie_file_waits_instead_of_refusing() {
+    let f = healthy_refill_wallet("100", "4");
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = refill_config(dir.path(), &f.url);
+    let text = std::fs::read_to_string(&cfg).unwrap().replace(
+        "user = \"pool\"",
+        &format!("cookie_file = \"{}/.cookie\"", dir.path().display()),
+    );
+    std::fs::write(&cfg, text).unwrap();
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "not a refusal: {err}");
+    assert!(err.contains("event=startup_waiting"), "{err}");
 }
 
 #[test]

@@ -143,11 +143,11 @@ pub fn settle(ctx: &Ctx, f: &InFlight, timeout: Duration) -> Result<Settled, Cyc
     })
 }
 
-/// The pool address's unspent notes, as `txid:pool:index`, including unconfirmed ones.
-/// zcashd lists them with `z_listunspent`; zecd lists them in `listunspent`. `None` when the
-/// wallet supports neither.
+/// Every unspent shielded note in the wallet, as `txid:pool:index`, including unconfirmed ones.
+/// The whole wallet, not just the pool's address: a send from a unified address may also spend
+/// the account's change notes, which sit at internal addresses. zcashd lists notes with
+/// `z_listunspent`; zecd lists them in `listunspent`. `None` when the wallet supports neither.
 pub fn source_notes(ctx: &Ctx) -> Result<Option<BTreeSet<String>>, CycleError> {
-    let ua = &ctx.cfg.shielded_address;
     let key = |e: &Value, index_field: &str| -> Option<String> {
         Some(format!(
             "{}:{}:{}",
@@ -161,16 +161,15 @@ pub fn source_notes(ctx: &Ctx) -> Result<Option<BTreeSet<String>>, CycleError> {
             "{method} returned a note without txid, pool or index"
         ))
     };
-    match ctx
-        .rpc
-        .read("z_listunspent", json!([0, 9_999_999, false, [ua]]))
-    {
+    match ctx.rpc.read("z_listunspent", json!([0, 9_999_999, false])) {
         Ok(v) => {
             let notes = v
                 .as_array()
                 .ok_or_else(|| RpcError::Protocol(format!("z_listunspent returned {v}")))?;
             return notes
                 .iter()
+                // Sprout notes carry no `outindex`; this tool never spends them.
+                .filter(|e| e.get("pool").and_then(Value::as_str) != Some("sprout"))
                 .map(|e| key(e, "outindex"))
                 .collect::<Option<BTreeSet<String>>>()
                 .map(Some)
@@ -189,7 +188,7 @@ pub fn source_notes(ctx: &Ctx) -> Result<Option<BTreeSet<String>>, CycleError> {
                 .filter(|e| {
                     matches!(
                         e.get("pool").and_then(Value::as_str),
-                        Some("orchard" | "ironwood")
+                        Some("sapling" | "orchard" | "ironwood")
                     )
                 })
                 .map(|e| key(e, "vout"))
@@ -202,9 +201,10 @@ pub fn source_notes(ctx: &Ctx) -> Result<Option<BTreeSet<String>>, CycleError> {
     }
 }
 
-/// `Some(true)` when every note recorded before the send is still unspent.
+/// `Some(true)` when every note recorded before the send is still unspent. An empty snapshot
+/// proves nothing (the listing may simply have missed the notes), so it gives `None`.
 fn notes_unspent(ctx: &Ctx, f: &InFlight) -> Result<Option<bool>, CycleError> {
-    let Some(before) = &f.notes_before else {
+    let Some(before) = f.notes_before.as_ref().filter(|b| !b.is_empty()) else {
         return Ok(None);
     };
     let Some(now) = source_notes(ctx)? else {

@@ -91,6 +91,15 @@ impl StateDir {
         Ok(None)
     }
 
+    /// Removes this command's halt marker. Returns whether there was one.
+    pub fn clear_halt(&self) -> Result<bool> {
+        match fs::remove_file(self.halt_path()) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).context("cannot remove the halt marker"),
+        }
+    }
+
     /// Stops the command from sending anything until an operator removes the marker.
     pub fn halt(&self, reason: &str) -> Result<()> {
         write_atomic(&self.halt_path(), format!("{reason}\n").as_bytes())

@@ -167,6 +167,19 @@ pub fn run(job: &mut dyn Job, ctx: &Ctx, once: bool) -> Exit {
     loop {
         match job.startup(ctx) {
             Ok(()) => break,
+            // With a cookie file, a 401 means the wallet restarted and is writing a new cookie
+            // (the client re-reads it on every 401): wait rather than refuse.
+            Err(StartupError::Refuse(e))
+                if ctx.cfg.rpc.cookie_file.is_some()
+                    && matches!(e.downcast_ref::<RpcError>(), Some(RpcError::Auth(_))) =>
+            {
+                log::warn!("event=startup_waiting cmd={cmd} reason={e:#}");
+                if once {
+                    return Exit::Failed;
+                }
+                std::thread::sleep(backoff(attempts));
+                attempts = attempts.saturating_add(1);
+            }
             Err(StartupError::Refuse(e)) => {
                 log::error!("event=refused cmd={cmd} reason={e:#}");
                 return Exit::Refused;

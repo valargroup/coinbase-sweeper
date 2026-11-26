@@ -261,6 +261,10 @@ impl Refill {
     }
 
     fn send(&self, ctx: &Ctx, state: &mut RefillState, amount: Zat) -> Result<(), CycleError> {
+        // The waits earlier in the cycle can be long: a halt set meanwhile still stops this send.
+        if let Some(reason) = ctx.state.halted()? {
+            return Err(CycleError::Failed(anyhow!("sending is halted: {reason}")));
+        }
         let dest = self.cfg.destination.clone();
         let wallet = ctx.wallet();
         let ops_before: BTreeSet<String> = wallet.operation_ids()?.into_iter().collect();
@@ -397,10 +401,19 @@ impl Refill {
                     f.amount
                 );
                 self.not_sent(ctx, state)?;
-                if let Some(opid) = opid {
-                    ctx.wallet().clear_operation(&opid);
+                match opid {
+                    Some(opid) => {
+                        ctx.wallet().clear_operation(&opid);
+                        Ok(())
+                    }
+                    // Settled from the notes alone: send nothing more until the next cycle
+                    // looks at the wallet afresh.
+                    None => Err(CycleError::Skip(
+                        "an interrupted refill was settled as not sent; the next cycle decides \
+                         again"
+                            .into(),
+                    )),
                 }
-                Ok(())
             }
             Settled::Wait(why) => {
                 log::warn!(
@@ -554,8 +567,20 @@ pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
             _ => {}
         }
         state.in_flight = None;
-        if resolution == Resolution::NotSent {
-            state.refund(&f);
+        match &evidence {
+            // The wallet knows the transaction: record it as the service would, so the next
+            // cycle checks it and waits for its confirmations.
+            Settled::Sent { txid, .. } => {
+                state.pending_check = Some(PendingCheck {
+                    txid: txid.clone(),
+                    amount: f.amount,
+                    destination: f.destination.clone(),
+                });
+                state.unconfirmed = Some(txid.clone());
+                state.last_txid = Some(txid.clone());
+            }
+            _ if resolution == Resolution::NotSent => state.refund(&f),
+            _ => {}
         }
         ctx.state.write_json("state", &state)?;
         log::warn!(
@@ -574,6 +599,23 @@ pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
             Exit::Refused
         }
     }
+}
+
+/// `refill --clear-halt`: after an operator has investigated a halt, accepts the transfer whose
+/// check failed (it is not checked again) and removes the marker.
+pub fn clear_halt(ctx: &Ctx) -> Result<()> {
+    let mut state = load_state(ctx)?;
+    if let Some(p) = state.pending_check.take() {
+        log::warn!(
+            "event=halt_cleared cmd=refill accepted_txid={} amount={}",
+            p.txid,
+            p.amount
+        );
+    }
+    ctx.state.write_json("state", &state)?;
+    let removed = ctx.state.clear_halt()?;
+    log::warn!("event=halt_cleared cmd=refill marker_removed={removed}");
+    Ok(())
 }
 
 /// Lines for `--check`.

@@ -79,8 +79,11 @@ tool on the machine that can reach the wallet's RPC port.
    zcash-cli z_getaddressforaccount 0 '["orchard"]'
    ```
 
-   Use the `address` field of the answer. On zcashd, if you have no account yet, create one first
-   with `zcash-cli z_getnewaccount` and use its number in place of `0`. The address must have an
+   Use the `address` field of the answer. On zcashd, create a **dedicated account** for the
+   pool's Ironwood funds with `zcash-cli z_getnewaccount` and use its number in place of `0`:
+   a refill spends from the whole account the address belongs to, not only from that address.
+   zecd has one account per wallet, so there use `0`, and keep no other Orchard or Ironwood
+   funds in that wallet: refills may spend any of them. The address must have an
    Orchard receiver and no Sapling receiver; the tool checks this at every start.
 
 3. **Build and install the tool** (needs Rust 1.89 or newer):
@@ -192,7 +195,7 @@ number of inputs, the amount, the txid and the outcome. With systemd:
 | `event=node_rejected` | ERROR | The node refused a transaction (for example, right at an upgrade). The command pauses for `rejection_pause_secs`, then tries again. |
 | `event=submit_unknown` | ERROR | A send got no usable answer. The tool never resends it; it settles what happened from the wallet first. |
 | `event=refill_unsettled` | ERROR | An interrupted refill cannot be settled from the wallet. Refills stop until you resolve it (see troubleshooting). |
-| `event=halted` | ERROR | A transaction did not pass its check. Both commands stop sending until you investigate and delete the halt file named in the line. |
+| `event=halted` | ERROR | A transaction did not pass its check (or could not be fetched to check it). Both commands stop sending until you investigate and clear the halt (see troubleshooting). |
 | `event=refused` | ERROR | Startup refused; `reason=` says why. The service stays stopped (exit code 1). |
 
 For a snapshot at any time, run `--check` (step 5).
@@ -210,7 +213,7 @@ For a snapshot at any time, run `--check` (step 5).
 | `the wallet cannot sign for <address>` | A coinbase address the wallet does not own. | Fix `sweep.coinbase_addresses`, or import the key into the wallet. |
 | `is not a transparent address on this network` | A shielded or wrong-network address in `coinbase_addresses`. | List only the transparent addresses your blocks pay. |
 | `another ... instance is already running` | A second copy of the same command. | Stop the other copy (often the service while you run `--once`). |
-| `reason=halted` | An earlier transaction failed its check. | Investigate the txid in the `event=halted` line, then delete the named `.halt` file. |
+| `reason=halted` | An earlier transaction failed its check, or could not be checked. | See "Clearing a halt" below. |
 | `refill.destination ... does not belong to this wallet` | An external destination without the confirmation line. | If the address is right, add `external_destination` with the same address. |
 | `external_destination ... does not match` | The two copies of the address differ. | Fix the typo. |
 | `top_up mode needs a transparent destination this wallet owns` | `top_up` with a shielded or external destination. | Use `drain_above` for those. |
@@ -223,11 +226,26 @@ For a snapshot at any time, run `--check` (step 5).
 | `sweep operation ... failed` / `refill operation ... failed` | The wallet could not build the transaction. | Read the wallet's message in the line. |
 | `insufficient_funds` (`event=refill_skip`) | The source cannot cover the transfer plus the fee yet. | Wait for more notes to confirm, or lower `target`. |
 | `would pass max_per_day` | The day's cap is reached. | Nothing, or raise `max_per_day` if the cap is too low. |
-| `an interrupted refill ... is not settled yet` | A refill was interrupted less than 10 minutes ago. | Nothing: the tool settles it on its own. |
-| `an interrupted refill ... cannot be settled` | The tool cannot tell from the wallet whether an interrupted refill happened. | Check the destination's history (`listtransactions`, or the payout wallet). Then run `coinbase-sweeper refill --config ... --resolve-interrupted sent` or `not-sent`. The tool refuses a verdict the wallet contradicts. |
-| `failed its check` (`event=halted`) | The wallet built a transaction that is not what was asked for. | Inspect the transaction; contact the wallet's maintainers. Delete the `.halt` file only once you understand it. |
-| `cannot be fetched to check it` | The transaction cannot be found to verify. | Look the txid up by hand; delete the `.halt` file once it is verified. |
+| `an interrupted refill ... is not settled yet` | A refill was interrupted recently. The tool waits the larger of 10 minutes and twice `rpc.submit_timeout_secs` before it will conclude that nothing was sent. | Nothing: the tool settles it on its own. |
+| `an interrupted refill ... cannot be settled` | The tool cannot tell from the wallet whether an interrupted refill happened. | Check the destination's history (`listtransactions`, or the payout wallet). Stop the refill service, run `coinbase-sweeper refill --config ... --resolve-interrupted sent` or `not-sent`, then start the service again. The tool refuses a verdict the wallet contradicts. |
+| `failed its check` (`event=halted`) | The wallet built a transaction that is not what was asked for. | Inspect the transaction (`getrawtransaction <txid> 1`); contact the wallet's maintainers. Clear the halt only once you understand it. |
+| `cannot be fetched to check it` | The transaction cannot be found to verify. | Look the txid up by hand (in the wallet, or a block explorer). Once it is verified, clear the halt. |
 | `state_write_failed` | The state directory is not writable or the disk is full. | Fix permissions or free space. The tool does not send while it cannot record. |
+
+**Clearing a halt.** After a halt, both services stop (exit code 1) and stay stopped. Once you
+have investigated the transaction named in the `event=halted` line:
+
+```sh
+sudo systemctl stop coinbase-sweeper-sweep coinbase-sweeper-refill
+coinbase-sweeper sweep --config /etc/coinbase-sweeper/sweeper.toml --clear-halt    # if sweep halted
+coinbase-sweeper refill --config /etc/coinbase-sweeper/sweeper.toml --clear-halt   # if refill halted
+sudo systemctl start coinbase-sweeper-sweep coinbase-sweeper-refill
+```
+
+`--clear-halt` accepts the transaction that caused the halt (it is not checked again) and
+removes that command's halt file; deleting the file by hand is not enough, because the same
+check would halt the command again. A halt from either command stops both. Likewise, after
+`--resolve-interrupted`, start the refill service again.
 
 ## 7. Security
 
@@ -248,7 +266,8 @@ For a snapshot at any time, run `--check` (step 5).
   `external_destination`). A typo in either stops the tool rather than sending money to the
   wrong place.
 - **Checks on every transaction.** Each sweep must have no transparent outputs, no Sapling
-  output, at least one Ironwood action, and a fee within bounds. Each refill must spend no
+  output, and at least one Ironwood action; when the wallet reports the amount shielded, the
+  fee must also be at most 0.01 ZEC. Each refill must spend no
   Sapling and no transparent funds, pay only your destination (for a transparent destination,
   exactly the amount sent), and pay a fee within `fee_headroom`. For a shielded destination the
   tool cannot see the recipient inside the shielded output; it checks the rest. A failed check
@@ -270,6 +289,11 @@ A transaction built right at the boundary may be refused by the node; the tool l
 `event=node_rejected`, pauses for `rejection_pause_secs`, and tries again. Nothing is lost.
 
 **zcashd or zecd?** Both work, with the same configuration. Differences you may notice:
+
+- zecd sends the change of a payout from your transparent payout address to a new address of
+  the wallet. In setup 1 the payout address's balance therefore drops by the full amount each
+  payout spends, and refills top it up by that much; the change collects at the wallet's other
+  addresses. Size `max_per_day` with that in mind.
 
 - zecd has one account per wallet, so use account `0` in step 2.
 - zcashd writes a new cookie file each time it starts; the tool reads it again automatically.

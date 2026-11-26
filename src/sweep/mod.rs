@@ -162,6 +162,24 @@ impl Job for Sweep {
     }
 }
 
+/// `sweep --clear-halt`: after an operator has investigated a halt, marks every recorded sweep
+/// as checked (so the same transaction does not halt the command again) and removes the marker.
+pub fn clear_halt(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut state: SweepState = ctx.state.read_json("state")?.unwrap_or_default();
+    for r in state.unconfirmed.iter_mut().filter(|r| !r.checked) {
+        log::warn!(
+            "event=halt_cleared cmd=sweep accepted_txid={} addr={}",
+            r.txid,
+            r.address
+        );
+        r.checked = true;
+    }
+    ctx.state.write_json("state", &state)?;
+    let removed = ctx.state.clear_halt()?;
+    log::warn!("event=halt_cleared cmd=sweep marker_removed={removed}");
+    Ok(())
+}
+
 impl Sweep {
     fn load(&self, ctx: &Ctx) -> Result<SweepState, CycleError> {
         Ok(ctx.state.read_json("state")?.unwrap_or_default())

@@ -54,6 +54,10 @@ struct Common {
     /// Print balances, pending operations and today's refill total, then exit.
     #[arg(long)]
     check: bool,
+    /// After investigating a halt: accept the transaction that caused it, remove this
+    /// command's halt marker, and exit.
+    #[arg(long)]
+    clear_halt: bool,
 }
 
 pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
@@ -89,9 +93,9 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         Ok(c) => c,
         Err(e) => return refuse(e),
     };
-    let credentials = match cfg.rpc.credentials(std::env::var(PASSWORD_ENV).ok()) {
+    let credentials = match wait_for_credentials(&cfg, cmd, common.once || common.dry_run) {
         Ok(c) => c,
-        Err(e) => return refuse(e),
+        Err(exit) => return exit,
     };
     let rpc = Rpc::new(
         &cfg.rpc.url,
@@ -112,10 +116,10 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         dry_run: common.dry_run,
     };
 
-    if resolution.is_some() && (common.dry_run || common.check) {
+    if (resolution.is_some() || common.clear_halt) && (common.dry_run || common.check) {
         return refuse(anyhow::anyhow!(
-            "--resolve-interrupted changes the refill state; it cannot be combined with \
-             --dry-run or --check"
+            "--resolve-interrupted and --clear-halt change the state; they cannot be combined \
+             with --dry-run or --check"
         ));
     }
     if common.check {
@@ -135,6 +139,16 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
     if let Some(resolution) = resolution {
         return refill::resolve_interrupted(&ctx, resolution);
     }
+    if common.clear_halt {
+        let cleared = match command {
+            Command::Sweep => sweep::clear_halt(&ctx),
+            Command::Refill => refill::clear_halt(&ctx),
+        };
+        return match cleared {
+            Ok(()) => Exit::Ok,
+            Err(e) => refuse(e),
+        };
+    }
 
     let mut job: Box<dyn Job> = match command {
         Command::Sweep => Box::new(sweep::Sweep::new(
@@ -149,6 +163,34 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         )),
     };
     runner::run(job.as_mut(), &ctx, common.once || common.dry_run)
+}
+
+/// A cookie file that is missing usually means the wallet is still starting (zcashd deletes it
+/// on shutdown): wait for it, unless running once. Any other credentials problem is a refusal.
+fn wait_for_credentials(
+    cfg: &Config,
+    cmd: &str,
+    once: bool,
+) -> Result<crate::config::Credentials, Exit> {
+    let mut delay = std::time::Duration::from_secs(cfg.general.interval_secs);
+    loop {
+        match cfg.rpc.credentials(std::env::var(PASSWORD_ENV).ok()) {
+            Ok(c) => return Ok(c),
+            Err(e) if cfg.rpc.cookie_file.as_ref().is_some_and(|p| !p.exists()) => {
+                log::warn!("event=startup_waiting cmd={cmd} reason={e:#}");
+                if once {
+                    return Err(Exit::Failed);
+                }
+                std::thread::sleep(delay);
+                delay =
+                    (delay * 2).min(std::time::Duration::from_secs(cfg.general.max_backoff_secs));
+            }
+            Err(e) => {
+                log::error!("event=refused cmd={cmd} reason={e:#}");
+                return Err(Exit::Refused);
+            }
+        }
+    }
 }
 
 fn init_logging() {
