@@ -112,6 +112,12 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> Exit {
         dry_run: common.dry_run,
     };
 
+    if resolution.is_some() && (common.dry_run || common.check) {
+        return refuse(anyhow::anyhow!(
+            "--resolve-interrupted changes the refill state; it cannot be combined with \
+             --dry-run or --check"
+        ));
+    }
     if common.check {
         return check::report(&ctx, command, &mut std::io::stdout());
     }

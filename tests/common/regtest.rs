@@ -448,7 +448,10 @@ impl Pool {
         self.mine(pool_blocks + 100).await;
         let cfg = self.config("fund.toml", &self.ua, "", &sweep_section(&self.taddr, 1));
         let (code, log) = self
-            .run_tool_mining(&["sweep", "--config", cfg.to_str().unwrap(), "--once"], "fund.log")
+            .run_tool_mining(
+                &["sweep", "--config", cfg.to_str().unwrap(), "--once"],
+                "fund.log",
+            )
             .await;
         assert_eq!(code, 0, "{log}");
         self.mine(12).await;

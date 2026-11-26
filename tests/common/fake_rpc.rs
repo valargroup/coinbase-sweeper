@@ -296,8 +296,10 @@ pub fn healthy_refill_wallet(spendable: &str, dest_balance: &str) -> FakeRpc {
     let dest_balance: Value = serde_json::from_str(dest_balance).unwrap();
     f.on("listunspent", move |p| {
         if p[2][0] == DEST {
-            Reply::Ok(json!([{"txid": "d0", "vout": 0, "address": DEST, "amount": dest_balance,
-                              "confirmations": 5}]))
+            Reply::Ok(
+                json!([{"txid": "d0", "vout": 0, "address": DEST, "amount": dest_balance,
+                              "confirmations": 5}]),
+            )
         } else {
             Reply::Ok(json!([]))
         }
@@ -307,14 +309,18 @@ pub fn healthy_refill_wallet(spendable: &str, dest_balance: &str) -> FakeRpc {
     let sent = Arc::new(Mutex::new(0u64));
     let s2 = sent.clone();
     f.on("z_sendmany", move |p| {
-        let zat = coinbase_sweeper::amount::Zat::from_json(&p[1][0]["amount"]).unwrap().0;
+        let zat = coinbase_sweeper::amount::Zat::from_json(&p[1][0]["amount"])
+            .unwrap()
+            .0;
         *s2.lock().unwrap() = zat;
         Reply::Ok(json!("opid-send"))
     });
     f.on("z_getoperationstatus", |p| {
         let id = p[0][0].as_str().unwrap_or("x").to_owned();
-        Reply::Ok(json!([{"id": id, "status": "success", "method": "z_sendmany",
-                          "result": {"txid": "refilltx"}}]))
+        Reply::Ok(
+            json!([{"id": id, "status": "success", "method": "z_sendmany",
+                          "result": {"txid": "refilltx"}}]),
+        )
     });
     f.on("getrawtransaction", move |_| {
         let zat = *sent.lock().unwrap();
@@ -365,7 +371,7 @@ max_per_day = 100
 }
 
 /// Writes a refill state file holding an interrupted transfer of 20 ZEC to DEST.
-pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, uptime: u64) {
+pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, uptime: u64, age: u64) {
     let state = dir.join("state");
     std::fs::create_dir_all(&state).unwrap();
     let now = std::time::SystemTime::now()
@@ -376,7 +382,7 @@ pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, uptime: u64)
         "day": now / 86_400,
         "sent_today": 2_000_000_000u64,
         "in_flight": {
-            "started_unix": now - 30,
+            "started_unix": now - age,
             "day": now / 86_400,
             "amount": 2_000_000_000u64,
             "destination": DEST,
