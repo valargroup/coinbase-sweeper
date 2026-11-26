@@ -34,6 +34,11 @@ struct SweepRecord {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SweepState {
     unconfirmed: Vec<SweepRecord>,
+    /// Set when the tool lost track of one of its own sweep operations (the wallet restarted or
+    /// stopped answering). Its transaction may still be in the mempool unseen, so no new sweep
+    /// starts until the wallet has scanned past this height.
+    #[serde(default)]
+    hold_until_height: Option<u64>,
 }
 
 pub struct Sweep {
@@ -86,6 +91,7 @@ impl Job for Sweep {
         if !ctx.dry_run {
             self.settle_previous(ctx)?;
             self.settle_records(ctx, chain)?;
+            self.check_hold(ctx, chain)?;
         }
         let utxos = wallet.list_unspent(COINBASE_MATURITY, &self.cfg.coinbase_addresses)?;
         let plans = plan::plan(&utxos, &self.cfg);
@@ -163,6 +169,42 @@ impl Sweep {
 
     fn save(&self, ctx: &Ctx, state: &SweepState) -> Result<(), CycleError> {
         Ok(ctx.state.write_json("state", state)?)
+    }
+
+    /// Holds new sweeps until the wallet has seen another block. Best effort on the height: if
+    /// the wallet cannot answer now, the hold starts from the height it reports next time.
+    fn hold(&self, ctx: &Ctx, opid: &str) -> Result<(), CycleError> {
+        let height = ctx.wallet().chain_status().map(|c| c.wallet_height).ok();
+        let mut state = self.load(ctx)?;
+        state.hold_until_height = Some(height.map_or(0, |h| h + 1));
+        log::warn!(
+            "event=sweep_hold cmd=sweep opid={opid} until_height={:?} reason=lost_operation",
+            state.hold_until_height
+        );
+        self.save(ctx, &state)
+    }
+
+    /// Skips the cycle while a hold is in force; clears it once the wallet is past it.
+    fn check_hold(&self, ctx: &Ctx, chain: &ChainStatus) -> Result<(), CycleError> {
+        let mut state = self.load(ctx)?;
+        let Some(until) = state.hold_until_height else {
+            return Ok(());
+        };
+        // A hold recorded without a height starts counting from now.
+        let until = if until == 0 {
+            state.hold_until_height = Some(chain.wallet_height + 1);
+            self.save(ctx, &state)?;
+            chain.wallet_height + 1
+        } else {
+            until
+        };
+        if chain.wallet_height < until {
+            return Err(CycleError::Skip(format!(
+                "waiting for block {until} after a sweep whose outcome was not seen"
+            )));
+        }
+        state.hold_until_height = None;
+        self.save(ctx, &state)
     }
 
     /// Drops a confirmed (or permanently failed) sweep from the state file.
@@ -328,15 +370,20 @@ impl Sweep {
 
     /// Waits for a sweep operation, then records and checks its transaction.
     fn finish_operation(&self, ctx: &Ctx, address: &str, opid: &str) -> Result<String, CycleError> {
-        let state = ctx
-            .wallet()
-            .wait_operation(opid, op_timeout(ctx), true)?
-            .ok_or_else(|| {
-                CycleError::Failed(anyhow!(
-                    "the wallet lost operation {opid} (did it restart?); its outcome will show \
-                     in the next cycle's listing"
-                ))
-            })?;
+        let state = match ctx.wallet().wait_operation(opid, op_timeout(ctx), true) {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                self.hold(ctx, opid)?;
+                return Err(CycleError::Failed(anyhow!(
+                    "the wallet lost operation {opid} (did it restart?); new sweeps wait for the \
+                     next block"
+                )));
+            }
+            Err(e) => {
+                self.hold(ctx, opid)?;
+                return Err(e.into());
+            }
+        };
         let txid = match state {
             OpState::Success { txid } => txid,
             OpState::Failed { code, message } if is_node_rejection(code, &message) => {

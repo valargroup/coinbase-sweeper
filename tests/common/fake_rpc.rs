@@ -284,3 +284,107 @@ pub fn run_bin(args: &[&str]) -> (i32, String) {
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
+
+pub const DEST: &str = "tmDest";
+
+/// A wallet for `refill`: the pool UA holds `spendable`, the owned t-address `DEST` holds
+/// `dest_balance`, and each z_sendmany succeeds with a v6 Ironwood transaction paying DEST.
+pub fn healthy_refill_wallet(spendable: &str, dest_balance: &str) -> FakeRpc {
+    let f = healthy_sweep_wallet(0);
+    let spendable: Value = serde_json::from_str(spendable).unwrap();
+    f.on("z_getbalance", move |_| Reply::Ok(spendable.clone()));
+    let dest_balance: Value = serde_json::from_str(dest_balance).unwrap();
+    f.on("listunspent", move |p| {
+        if p[2][0] == DEST {
+            Reply::Ok(json!([{"txid": "d0", "vout": 0, "address": DEST, "amount": dest_balance,
+                              "confirmations": 5}]))
+        } else {
+            Reply::Ok(json!([]))
+        }
+    });
+    f.on("uptime", |_| Reply::Ok(json!(100_000)));
+    f.on("listtransactions", |_| Reply::Ok(json!([])));
+    let sent = Arc::new(Mutex::new(0u64));
+    let s2 = sent.clone();
+    f.on("z_sendmany", move |p| {
+        let zat = coinbase_sweeper::amount::Zat::from_json(&p[1][0]["amount"]).unwrap().0;
+        *s2.lock().unwrap() = zat;
+        Reply::Ok(json!("opid-send"))
+    });
+    f.on("z_getoperationstatus", |p| {
+        let id = p[0][0].as_str().unwrap_or("x").to_owned();
+        Reply::Ok(json!([{"id": id, "status": "success", "method": "z_sendmany",
+                          "result": {"txid": "refilltx"}}]))
+    });
+    f.on("getrawtransaction", move |_| {
+        let zat = *sent.lock().unwrap();
+        Reply::Ok(v6_refill_tx(DEST, zat))
+    });
+    f
+}
+
+pub fn v6_refill_tx(dest: &str, zat: u64) -> Value {
+    json!({
+        "version": 6, "vin": [],
+        "vout": [{"valueZat": zat, "scriptPubKey": {"addresses": [dest]}}],
+        "vShieldedSpend": [], "vShieldedOutput": [],
+        "orchard": {"actions": [], "valueBalanceZat": 0},
+        "ironwood": {"actions": [{}, {}], "valueBalanceZat": zat + 15000}
+    })
+}
+
+/// Writes a top_up refill config (low_water 10, target 25) into `dir`.
+pub fn refill_config(dir: &std::path::Path, url: &str) -> std::path::PathBuf {
+    let text = format!(
+        r#"shielded_address = "{UA}"
+[rpc]
+url = "{url}"
+user = "pool"
+timeout_secs = 2
+submit_timeout_secs = 2
+read_retries = 1
+[general]
+state_dir = "{}"
+interval_secs = 1
+max_backoff_secs = 2
+operation_timeout_secs = 10
+confirmation_timeout_secs = 10
+[refill]
+mode = "top_up"
+destination = "{DEST}"
+low_water = 10
+target = 25
+max_per_transfer = 30
+max_per_day = 100
+"#,
+        dir.join("state").display()
+    );
+    let p = dir.join("refill.toml");
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
+/// Writes a refill state file holding an interrupted transfer of 20 ZEC to DEST.
+pub fn interrupted_state(dir: &std::path::Path, opid: Option<&str>, uptime: u64) {
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let s = json!({
+        "day": now / 86_400,
+        "sent_today": 2_000_000_000u64,
+        "in_flight": {
+            "started_unix": now - 30,
+            "day": now / 86_400,
+            "amount": 2_000_000_000u64,
+            "destination": DEST,
+            "opid": opid,
+            "ops_before": [],
+            "wallet_uptime": uptime
+        },
+        "unconfirmed": null
+    });
+    std::fs::write(state.join("refill.state"), s.to_string()).unwrap();
+}

@@ -337,7 +337,7 @@ fn an_expired_previous_sweep_does_not_wedge_the_command() {
     .unwrap();
     f.on("gettransaction", |p| {
         if p[0] == "old" {
-            Reply::Ok(json!({"confirmations": 0, "expiryheight": 450}))
+            Reply::Ok(json!({"confirmations": 0, "expiryheight": 450, "status": "expired"}))
         } else {
             Reply::Ok(json!({"confirmations": 1}))
         }
@@ -347,4 +347,27 @@ fn an_expired_previous_sweep_does_not_wedge_the_command() {
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("event=sweep_gone"), "{err}");
     assert_eq!(f.calls("z_shieldcoinbase"), 1);
+}
+
+#[test]
+fn a_transient_minus_one_is_not_mistaken_for_a_lost_sweep() {
+    // Each confirmation poll first sees the -1 a wallet reports while it processes a block.
+    let f = healthy_sweep_wallet(120);
+    let polls = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let p2 = polls.clone();
+    f.on("gettransaction", move |_| {
+        let mut n = p2.lock().unwrap();
+        *n += 1;
+        if *n % 2 == 1 {
+            Reply::Ok(json!({"confirmations": -1, "status": "waiting", "expiryheight": 540}))
+        } else {
+            Reply::Ok(json!({"confirmations": 1}))
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sweep_config(dir.path(), &f.url, "");
+    let (code, err) = run_bin(&["sweep", "--config", cfg.to_str().unwrap(), "--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("sweep_gone"), "{err}");
+    assert_eq!(f.calls("z_shieldcoinbase"), 3);
 }

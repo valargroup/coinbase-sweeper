@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 use crate::amount::Zat;
 use crate::rpc::{Rpc, RpcError};
 
+/// Blocks past a transaction's expiry height before the tool treats it as never confirming.
+pub const EXPIRY_MARGIN: u64 = 3;
+
 /// Consensus coinbase maturity: a coinbase output is spendable once it has this many
 /// confirmations. A fixed rule of the network, not a setting.
 pub const COINBASE_MATURITY: u64 = 100;
@@ -201,26 +204,37 @@ impl<'a> Wallet<'a> {
         }
     }
 
-    /// Where a wallet transaction stands, from `gettransaction`. `tip` is the wallet's height.
+    /// Where a wallet transaction stands. `tip` is the wallet's height.
+    ///
+    /// `Gone` is decided conservatively, because it tells the caller the inputs are free again:
+    /// only when neither the wallet nor the node knows the transaction, or when it is still
+    /// unmined `EXPIRY_MARGIN` blocks after its expiry height. Wallets briefly report 0 or -1
+    /// confirmations, or a non-"mined" status, while they process a new block; those readings
+    /// are `Pending`, never `Gone`.
     pub fn tx_status(&self, txid: &str, tip: u64) -> Result<TxStatus, RpcError> {
         let v = match self.rpc.read("gettransaction", json!([txid])) {
-            Err(RpcError::Rpc { code: -5, .. }) => return Ok(TxStatus::Gone),
+            Err(RpcError::Rpc { code: -5, .. }) => {
+                return match self.raw_transaction(txid) {
+                    Ok(_) => Ok(TxStatus::Pending),
+                    Err(RpcError::Rpc { code: -5, .. }) => Ok(TxStatus::Gone),
+                    Err(e) => Err(e),
+                };
+            }
             other => other?,
         };
         let confirmations = v.get("confirmations").and_then(Value::as_i64).unwrap_or(0);
         if confirmations > 0 {
             return Ok(TxStatus::Confirmed(confirmations as u64));
         }
-        // -1: conflicted (its inputs were spent elsewhere). An unmined transaction past its
-        // expiry height can never be mined.
-        let expired = v.get("status").and_then(Value::as_str) == Some("expired")
-            || v.get("expiryheight")
-                .and_then(Value::as_u64)
-                .is_some_and(|h| h > 0 && tip > h);
-        if confirmations < 0 || expired {
-            return Ok(TxStatus::Gone);
-        }
-        Ok(TxStatus::Pending)
+        let expired = v
+            .get("expiryheight")
+            .and_then(Value::as_u64)
+            .is_some_and(|h| h > 0 && tip > h.saturating_add(EXPIRY_MARGIN));
+        Ok(if expired {
+            TxStatus::Gone
+        } else {
+            TxStatus::Pending
+        })
     }
 
     /// Waits until `txid` has `want` confirmations, or returns `TxStatus::Gone` early when it can
@@ -285,11 +299,17 @@ pub fn parse_chain_status(v: &Value) -> Result<ChainStatus> {
         .get("verificationprogress")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
-    let initial_block_download = v
+    // zecd and bitcoind say `initialblockdownload`; zcashd says `initial_block_download_complete`.
+    let in_ibd = v
         .get("initialblockdownload")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && progress < 0.999;
+        .or_else(|| {
+            v.get("initial_block_download_complete")
+                .and_then(Value::as_bool)
+                .map(|done| !done)
+        })
+        .unwrap_or(false);
+    let initial_block_download = in_ibd && progress < 0.999;
     Ok(ChainStatus {
         wallet_height,
         node_height,
@@ -420,5 +440,9 @@ mod tests {
         };
         assert!(ibd(0.5));
         assert!(!ibd(1.0), "fully scanned, only backfilling details");
+        let zcashd = parse_chain_status(&json!({"blocks": 1, "headers": 1,
+            "initial_block_download_complete": false, "verificationprogress": 0.2}))
+        .unwrap();
+        assert!(zcashd.initial_block_download);
     }
 }

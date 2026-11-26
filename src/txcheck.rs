@@ -90,8 +90,25 @@ pub fn check_refill(
     destination: &str,
     transparent_destination: bool,
     amount: Zat,
+    max_fee: Zat,
 ) -> Result<()> {
     common(tx)?;
+    // With no transparent inputs, the fee is what leaves the shielded pools minus what the
+    // transparent outputs receive.
+    let shielded_out = value_balance_zat(tx, "ironwood")? + value_balance_zat(tx, "orchard")?;
+    let transparent_out: i64 = array(tx, "vout")?
+        .iter()
+        .map(|o| {
+            o.get("valueZat")
+                .and_then(Value::as_i64)
+                .unwrap_or(i64::MAX)
+        })
+        .fold(0i64, |a, b| a.saturating_add(b));
+    let fee = shielded_out.saturating_sub(transparent_out);
+    ensure!(
+        fee >= 0 && fee as u64 <= max_fee.0,
+        "refill pays a fee of {fee} zatoshis, above fee_headroom {max_fee} ZEC"
+    );
     ensure!(
         array(tx, "vin")?.is_empty(),
         "refill spends transparent inputs"
@@ -195,14 +212,14 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"valueZat": 5, "scriptPubKey": {"addresses": ["tmOther"]}}));
-        assert!(check_refill(&refill, "tmDest", true, Zat(100)).is_err());
+        assert!(check_refill(&refill, "tmDest", true, Zat(100), Zat(100_000)).is_err());
     }
 
     #[test]
     fn rejects_sapling_spend() {
         let mut tx = v6_refill("tmDest", 100);
         tx["vShieldedSpend"] = json!([{"nullifier": "00"}]);
-        assert!(check_refill(&tx, "tmDest", true, Zat(100))
+        assert!(check_refill(&tx, "tmDest", true, Zat(100), Zat(100_000))
             .unwrap_err()
             .to_string()
             .contains("Sapling"));
@@ -210,13 +227,25 @@ mod tests {
 
     #[test]
     fn refill_destination_and_amount() {
-        check_refill(&v6_refill("tmDest", 100), "tmDest", true, Zat(100)).unwrap();
-        assert!(check_refill(&v6_refill("tmOther", 100), "tmDest", true, Zat(100)).is_err());
-        assert!(check_refill(&v6_refill("tmDest", 99), "tmDest", true, Zat(100)).is_err());
-        assert!(check_refill(&v6_refill("tmDest", 100), "uDest", false, Zat(100)).is_err());
+        let fee = Zat(100_000);
+        check_refill(&v6_refill("tmDest", 100), "tmDest", true, Zat(100), fee).unwrap();
+        assert!(check_refill(&v6_refill("tmOther", 100), "tmDest", true, Zat(100), fee).is_err());
+        assert!(check_refill(&v6_refill("tmDest", 99), "tmDest", true, Zat(100), fee).is_err());
+        assert!(check_refill(&v6_refill("tmDest", 100), "uDest", false, Zat(100), fee).is_err());
         let mut shielded = v6_refill("x", 0);
         shielded["vout"] = json!([]);
-        check_refill(&shielded, "uDest", false, Zat(100)).unwrap();
+        check_refill(&shielded, "uDest", false, Zat(100), fee).unwrap();
+        // A fee above the headroom fails.
+        assert!(check_refill(
+            &v6_refill("tmDest", 100),
+            "tmDest",
+            true,
+            Zat(100),
+            Zat(14_999)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fee"));
     }
 
     #[test]

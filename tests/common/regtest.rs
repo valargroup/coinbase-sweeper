@@ -365,7 +365,9 @@ impl Pool {
             if done(&log) {
                 return served;
             }
-            let waits = log.matches("event=wait_confirmation").count();
+            // A confirmation wait, or a hold after a lost operation, needs a new block.
+            let waits = log.matches("event=wait_confirmation").count()
+                + log.matches("waiting for block").count();
             if waits > served {
                 self.mine(1).await;
                 served = waits;
@@ -377,4 +379,86 @@ impl Pool {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
+}
+
+impl Pool {
+    /// Sends from one of the wallet's addresses and waits for the operation, then mines a block.
+    pub async fn send_from(&self, from: &str, to: &str, zec: &str, policy: &str) -> String {
+        let amount: Value = serde_json::from_str(zec).unwrap();
+        let opid = self
+            .call(
+                "z_sendmany",
+                json!([from, [{"address": to, "amount": amount}], 1, null, policy]),
+            )
+            .await;
+        let opid = opid.as_str().unwrap().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let txid = loop {
+            let r = self.call("z_getoperationresult", json!([[opid]])).await;
+            if let Some(op) = r.as_array().and_then(|a| a.first()) {
+                assert_eq!(op["status"], "success", "{op}");
+                break op["result"]["txid"].as_str().unwrap().to_owned();
+            }
+            assert!(Instant::now() < deadline, "send {opid} did not finish");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+        self.mine(1).await;
+        txid
+    }
+
+    /// The transparent balance of `address` at any depth.
+    pub async fn t_balance(&self, address: &str) -> f64 {
+        let v = self
+            .call("listunspent", json!([0, 9_999_999, [address]]))
+            .await;
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["amount"].as_f64().unwrap())
+            .sum()
+    }
+
+    /// Transactions mined in blocks `from..=tip` that pay `address`, with the amount paid.
+    pub async fn payments_to(&self, address: &str, from: u64) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for h in from..=self.tip().await {
+            let hash = self.zebrad.rpc("getblockhash", json!([h])).await.unwrap();
+            let block = self.zebrad.rpc("getblock", json!([hash, 1])).await.unwrap();
+            for txid in block["tx"].as_array().unwrap().iter().skip(1) {
+                let tx = self
+                    .zebrad
+                    .rpc("getrawtransaction", json!([txid, 1]))
+                    .await
+                    .unwrap();
+                for o in tx["vout"].as_array().unwrap() {
+                    if o["scriptPubKey"]["addresses"][0] == json!(address) {
+                        out.push((
+                            txid.as_str().unwrap().to_owned(),
+                            o["valueZat"].as_u64().unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Fills the pool's Ironwood balance: mature coinbase swept, then `minconf` blocks mined.
+    pub async fn fund_ironwood(&self, pool_blocks: u32) -> f64 {
+        self.mine(pool_blocks + 100).await;
+        let cfg = self.config("fund.toml", &self.ua, "", &sweep_section(&self.taddr, 1));
+        let (code, log) = self
+            .run_tool_mining(&["sweep", "--config", cfg.to_str().unwrap(), "--once"], "fund.log")
+            .await;
+        assert_eq!(code, 0, "{log}");
+        self.mine(12).await;
+        self.call("z_getbalance", json!([self.ua, 10]))
+            .await
+            .as_f64()
+            .unwrap()
+    }
+}
+
+pub fn refill_section(body: &str) -> String {
+    format!("[refill]\nminconf = 10\nwait_confirmations = 1\nmin_transfer = 0.01\n{body}\n")
 }
