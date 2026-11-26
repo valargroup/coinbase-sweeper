@@ -31,6 +31,11 @@ The wallet needs a node that is past the Ironwood activation.
 
 ## Build
 
+[Releases](https://github.com/valargroup/coinbase-sweeper/releases) provide static
+Linux binaries for amd64 and arm64. Download your architecture's tarball and
+`SHA256SUMS` into the same directory, then verify it with
+`sha256sum --check --ignore-missing SHA256SUMS` before extracting it.
+
 Requires Rust 1.89 or newer (the lock file uses the standard library's file locking, added
 in 1.89).
 

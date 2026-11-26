@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUSTUP_TOOLCHAIN: "1.97.1"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate the release version
+        id: version
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.loads(open("Cargo.toml").read())["package"]["version"])')"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME must match the package version (v$version)."
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+
+      - name: Test the sweeper
+        run: cargo test --locked
+
+  binary:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the native musl compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Build and verify the static binary
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET_CC: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-Wl,--build-id=none"
+        run: |
+          cargo build --release --locked --bin coinbase-sweeper --target "$TARGET"
+          install -D -m 0755 "target/$TARGET/release/coinbase-sweeper" out/coinbase-sweeper
+          program_headers="$(readelf --program-headers --wide out/coinbase-sweeper)"
+          dynamic_section="$(readelf --dynamic --wide out/coinbase-sweeper)"
+          if [[ "$program_headers" == *INTERP* || "$dynamic_section" == *NEEDED* ]]; then
+            echo "::error::Release binary has a dynamic interpreter or shared library dependency."
+            exit 1
+          fi
+          test "$(./out/coinbase-sweeper --version)" = "coinbase-sweeper $VERSION"
+
+      - name: Package the binary
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          bundle="coinbase-sweeper-$VERSION-linux-$ARCH"
+          install -D -m 0755 out/coinbase-sweeper "$bundle/coinbase-sweeper"
+          cp README.md CHANGELOG.md sweeper.example.toml "$bundle/"
+          cp -R docs deploy "$bundle/"
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1 -cf "$bundle.tar" "$bundle"
+          gzip -9n "$bundle.tar"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: coinbase-sweeper-*.tar.gz
+          if-no-files-found: error
+          overwrite: true
+
+  assemble:
+    needs: [check, binary]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.commit }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the bundle and extract release notes
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          awk -v heading="## [$VERSION]" '
+            /^## / { if (found) exit; found = index($0, heading " - ") == 1; next }
+            found { print; if (NF) has_notes = 1 }
+            END { if (!has_notes) exit 1 }
+          ' CHANGELOG.md > dist/release-notes.md
+          cd dist
+          sha256sum "coinbase-sweeper-$VERSION-linux-amd64.tar.gz" \
+                    "coinbase-sweeper-$VERSION-linux-arm64.tar.gz" > SHA256SUMS
+          sha256sum --strict --check SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: [check, assemble]
+    if: github.repository == 'valargroup/coinbase-sweeper' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release
+          path: dist
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.check.outputs.commit }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          tagged_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$tag" --jq .sha)"
+          if [[ "$tagged_commit" != "$COMMIT" ]]; then
+            echo "::error::Tag $tag no longer points to the verified build commit."
+            exit 1
+          fi
+          cd dist
+          sha256sum --strict --check SHA256SUMS
+          flags=()
+          if [[ "$tag" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$tag" ./*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --notes-file release-notes.md --title "$tag" "${flags[@]}"
