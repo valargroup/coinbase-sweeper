@@ -79,6 +79,7 @@ change, a8b5d25f7, only edits a Python test).
 
 ```sh
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test   # regtests skip
+export ZAKURAD_BIN=/path/to/zakurad ZECD_BIN=/path/to/zecd
 . scripts/regtest-env.sh     # ZECD_REGTEST_NODE=zakura, ZAKURAD_BIN, ZECD_BIN,
                              # ZECD_REGTEST_NU63_HEIGHT=8, ZECD_REGTEST_NU7_HEIGHT=12
 cargo test --test regtest_sweep --test regtest_refill -- --test-threads=1 --nocapture
