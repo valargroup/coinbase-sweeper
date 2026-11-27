@@ -46,12 +46,27 @@ What the tool is not:
 | Your pool today | What to run |
 | --- | --- |
 | **Setup 1.** Coinbase goes to a transparent address, and miners are paid from that same transparent address (it is refilled from shielded funds). | `sweep`, plus `refill` in `top_up` mode with the destination set to that address. |
-| **Setup 2.** Coinbase goes to a transparent address, and miners are paid from a separate wallet. | `sweep`, plus `refill` in `drain_above` mode with the destination set to the payout wallet's address. |
+| **Setup 2.** Coinbase goes to a transparent address, and miners are paid from a separate wallet. | `sweep`, plus `refill` in `drain_above` mode with the destination set to the payout wallet's address, or `destinations` set to its addresses if it pays from several. |
 | **Setup 3.** Coinbase is already paid straight into Ironwood. | Nothing. This tool is not needed. |
 | **Setup 4.** Your pool software already sweeps coinbase into a unified address. | Change that destination to an Orchard-only unified address (section 3, step 2). A unified address that also has a Sapling receiver does not qualify: create a new Orchard-only one. This tool is not needed. |
 
 `sweep` and `refill` are separate commands. Each runs on its own, and you can run either or
 both. [CONFIGURATION.md](CONFIGURATION.md) has a complete example for setups 1 and 2.
+
+**Several payout addresses.** If your pool pays miners from more than one transparent address,
+list them in `refill.destinations` instead of setting `refill.destination`. One refill pays one
+destination, never several in one transaction. In `drain_above` mode the destinations take turns
+in the order listed: each refill pays the one after the destination the last refill paid, and
+after the last one it starts again at the first. The tool remembers the last destination paid
+in its state file, so the order survives restarts; a destination counts as paid only once its
+transfer is known to have been sent (from the wallet, or from your `--resolve-interrupted sent`
+verdict). In `top_up` mode every cycle reads each destination's
+payable balance and refills the one with the lowest balance, if that is below `low_water`, up
+to `target`. Either way there is at most one refill per cycle, and `max_per_transfer`,
+`max_per_day`, `min_transfer` and `fee_headroom` apply to all destinations together, not to each.
+You can add, remove or reorder destinations between runs: a refill already in progress is
+settled and checked against the address it was sent to, even if that address is no longer in
+the config.
 
 In setups 3 and 4 your pool pays miners from the Orchard-only address directly, with
 `z_sendmany` from that address (privacy policy `AllowRevealedRecipients` for transparent
@@ -214,9 +229,9 @@ For a snapshot at any time, run `--check` (step 5).
 | `is not a transparent address on this network` | A shielded or wrong-network address in `coinbase_addresses`. | List only the transparent addresses your blocks pay. |
 | `another ... instance is already running` | A second copy of the same command. | Stop the other copy (often the service while you run `--once`). |
 | `reason=halted` | An earlier transaction failed its check, or could not be checked. | See "Clearing a halt" below. |
-| `refill.destination ... does not belong to this wallet` | An external destination without the confirmation line. | If the address is right, add `external_destination` with the same address. |
+| `refill destination ... does not belong to this wallet` | An external destination without the confirmation line. | If the address is right, add `external_destination` with the same address (or, with `destinations`, add it to `external_destinations`). |
 | `external_destination ... does not match` | The two copies of the address differ. | Fix the typo. |
-| `top_up mode needs a transparent destination this wallet owns` | `top_up` with a shielded or external destination. | Use `drain_above` for those. |
+| `top_up mode needs transparent destinations this wallet owns` | `top_up` with a shielded or external destination. | Use `drain_above` for those. |
 | `has no Orchard receiver, so a transfer to it could not stay in Ironwood` | A shielded destination without an Orchard receiver. | Use a unified address with an Orchard receiver, or a transparent address. |
 | `the wallet has no connection to the node or network` | The wallet lost its node or peers. | Check the node; the tool resumes on its own. |
 | `the wallet is N blocks behind the node` / `still syncing` | The wallet is catching up. | Wait; the tool resumes on its own. |
@@ -263,8 +278,8 @@ check would halt the command again. A halt from either command stops both. Likew
   the first fill of the payout address on the day you start. Your own figures take precedence
   over this rule of thumb.
 - **The destination is written twice** when the wallet does not own it (`destination` and
-  `external_destination`). A typo in either stops the tool rather than sending money to the
-  wrong place.
+  `external_destination`, or `destinations` and `external_destinations`). A typo in either
+  stops the tool rather than sending money to the wrong place.
 - **Checks on every transaction.** Each sweep must have no transparent outputs, no Sapling
   output, and at least one Ironwood action; when the wallet reports the amount shielded, the
   fee must also be at most 0.01 ZEC. Each refill must spend no

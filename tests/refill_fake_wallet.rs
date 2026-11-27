@@ -412,3 +412,298 @@ fn clear_halt_refuses_when_not_halted() {
     assert!(err.contains("not halted"), "{err}");
     assert!(state(dir.path())["pending_check"].is_object());
 }
+
+// Several destinations.
+
+const A: &str = "tmPayA";
+const B: &str = "tmPayB";
+const C: &str = "tmPayC";
+
+/// What each txid paid: (address, zatoshis).
+type Built = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>>;
+
+/// A refill wallet whose owned t-addresses hold `balances`. Each z_sendmany gets its own
+/// operation and txid, and the transaction it builds pays the address and amount it was asked.
+fn multi_wallet(spendable: &str, balances: &[(&str, &str)]) -> (FakeRpc, Built) {
+    let f = healthy_refill_wallet(spendable, "0");
+    let balances: Vec<(String, Value)> = balances
+        .iter()
+        .map(|(a, b)| (a.to_string(), serde_json::from_str(b).unwrap()))
+        .collect();
+    f.on("listunspent", move |p| {
+        let found = balances.iter().find(|(a, _)| p[2][0] == json!(a));
+        Reply::Ok(match found {
+            Some((a, b)) => json!([{"txid": format!("d-{a}"), "vout": 0, "address": a,
+                                    "amount": b, "confirmations": 5}]),
+            None => json!([]),
+        })
+    });
+    let built: Built = Default::default();
+    let b2 = built.clone();
+    f.on("z_sendmany", move |p| {
+        let mut b = b2.lock().unwrap();
+        let opid = format!("opid-{}", b.len() + 1);
+        let zat = coinbase_sweeper::amount::Zat::from_json(&p[1][0]["amount"])
+            .unwrap()
+            .0;
+        let addr = p[1][0]["address"].as_str().unwrap().to_owned();
+        b.insert(format!("tx-{opid}"), (addr, zat));
+        Reply::Ok(json!(opid))
+    });
+    f.on("z_getoperationstatus", |p| {
+        let id = p[0][0].as_str().unwrap_or("x").to_owned();
+        Reply::Ok(
+            json!([{"id": id, "status": "success", "method": "z_sendmany",
+                          "result": {"txid": format!("tx-{id}")}}]),
+        )
+    });
+    let b3 = built.clone();
+    f.on("getrawtransaction", move |p| {
+        let b = b3.lock().unwrap();
+        let (addr, zat) = &b[p[0].as_str().unwrap()];
+        Reply::Ok(v6_refill_tx(addr, *zat))
+    });
+    (f, built)
+}
+
+/// The default refill config with its `[refill]` section replaced.
+fn multi_config(dir: &std::path::Path, url: &str, section: &str) -> std::path::PathBuf {
+    let cfg = refill_config(dir, url);
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let head = text.split("[refill]").next().unwrap();
+    std::fs::write(&cfg, format!("{head}[refill]\n{section}")).unwrap();
+    cfg
+}
+
+fn drain_above(destinations: &str) -> String {
+    format!(
+        "mode = \"drain_above\"\n{destinations}\nreserve = 50\nmax_per_transfer = 5\n\
+         max_per_day = 1000\n"
+    )
+}
+
+fn top_up(destinations: &str) -> String {
+    format!(
+        "mode = \"top_up\"\n{destinations}\nlow_water = 10\ntarget = 25\n\
+         max_per_transfer = 30\nmax_per_day = 100\n"
+    )
+}
+
+fn paid_addresses(f: &FakeRpc) -> Vec<String> {
+    f.params("z_sendmany")
+        .iter()
+        .map(|p| p[1][0]["address"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn drain_above_rotates_one_destination_per_transfer() {
+    let (f, _) = multi_wallet("100", &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("destinations = [\"{A}\", \"{B}\", \"{C}\"]")),
+    );
+    for i in 0..4 {
+        let (code, err) = run(&cfg, &["--once"]);
+        assert_eq!(code, 0, "run {i}: {err}");
+    }
+    assert_eq!(paid_addresses(&f), [A, B, C, A], "wraps around");
+    for p in f.params("z_sendmany") {
+        assert_eq!(
+            p[1].as_array().unwrap().len(),
+            1,
+            "one destination per transfer"
+        );
+        assert_eq!(p[1][0]["amount"].to_string(), "5.00000000");
+    }
+    let s = state(dir.path());
+    assert_eq!(s["last_destination"], json!(A));
+    assert_eq!(
+        s["sent_today"],
+        json!(2_000_000_000u64),
+        "one shared daily total"
+    );
+
+    // A transfer the wallet could not fund was not sent: the turn does not move on.
+    f.on("z_sendmany", |_| rpc_err(-6, "Insufficient funds"));
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains(&format!(
+            "addr={B} amount=5.00000000 reason=insufficient_funds"
+        )),
+        "{err}"
+    );
+    assert_eq!(state(dir.path())["last_destination"], json!(A));
+}
+
+#[test]
+fn the_daily_cap_is_shared_by_all_destinations() {
+    let (f, _) = multi_wallet("100", &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("destinations = [\"{A}\", \"{B}\", \"{C}\"]"))
+            .replace("max_per_day = 1000", "max_per_day = 10"),
+    );
+    for _ in 0..2 {
+        let (code, err) = run(&cfg, &["--once"]);
+        assert_eq!(code, 0, "{err}");
+    }
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(paid_addresses(&f), [A, B]);
+    assert!(err.contains("max_per_day"), "{err}");
+    assert!(
+        err.contains(&format!("event=refill_skip cmd=refill addr={C}")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_single_destination_behaves_as_before() {
+    let (f, _) = multi_wallet("100", &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("destination = \"{A}\"")),
+    );
+    for _ in 0..3 {
+        let (code, err) = run(&cfg, &["--once"]);
+        assert_eq!(code, 0, "{err}");
+    }
+    assert_eq!(paid_addresses(&f), [A, A, A]);
+    let p = &f.params("z_sendmany")[0];
+    assert_eq!(p[0], json!(UA));
+    assert_eq!(p[2], json!(10));
+    assert_eq!(p[3], Value::Null);
+    assert_eq!(p[4], json!("AllowRevealedRecipients"));
+}
+
+#[test]
+fn top_up_refills_the_emptiest_destination_below_low_water() {
+    let (f, _) = multi_wallet("100", &[(A, "8"), (B, "3"), (C, "12")]);
+    let dir = tempfile::tempdir().unwrap();
+    let section = top_up(&format!("destinations = [\"{A}\", \"{B}\", \"{C}\"]"));
+    let cfg = multi_config(dir.path(), &f.url, &section);
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(paid_addresses(&f), [B]);
+    assert_eq!(
+        f.params("z_sendmany")[0][1][0]["amount"].to_string(),
+        "22.00000000",
+        "up to target"
+    );
+    assert_eq!(
+        f.calls("listunspent"),
+        3,
+        "each destination's balance was read"
+    );
+
+    // Every destination at or above low_water: nothing is sent.
+    let (f, _) = multi_wallet("100", &[(A, "18"), (B, "10"), (C, "12")]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = multi_config(dir.path(), &f.url, &section);
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains(&format!("addr={B}")), "{err}");
+    assert!(err.contains("not below low_water"), "{err}");
+    assert_eq!(f.calls("z_sendmany"), 0);
+}
+
+#[test]
+fn an_external_destination_in_a_list_needs_the_double_entry() {
+    let (f, _) = multi_wallet("100", &[]);
+    f.on("validateaddress", |p| {
+        Reply::Ok(json!({"isvalid": true, "ismine": p[0] != json!(B)}))
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let list = format!("destinations = [\"{A}\", \"{B}\"]");
+    let cfg = multi_config(dir.path(), &f.url, &drain_above(&list));
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains(&format!("external_destinations = [\"{B}\"]")),
+        "{err}"
+    );
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("{list}\nexternal_destinations = [\"{B}\"]")),
+    );
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(paid_addresses(&f), [A]);
+}
+
+#[test]
+fn an_in_flight_transfer_to_a_removed_destination_still_settles() {
+    // A transfer to DEST was interrupted; the operator then replaced DEST by A and B.
+    let (f, built) = multi_wallet("100", &[]);
+    built
+        .lock()
+        .unwrap()
+        .insert("tx-opid-old".into(), (DEST.into(), 2_000_000_000));
+    f.on("z_listoperationids", |_| Reply::Ok(json!(["opid-old"])));
+    let dir = tempfile::tempdir().unwrap();
+    interrupted_state(dir.path(), Some("opid-old"), true, 30);
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("destinations = [\"{A}\", \"{B}\"]")),
+    );
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains(&format!(
+            "event=refilled cmd=refill addr={DEST} amount=20.00000000 txid=tx-opid-old"
+        )),
+        "settled against the recorded destination: {err}"
+    );
+    assert!(err.contains("outcome=ok_recovered"), "{err}");
+    assert!(!err.contains("event=halted"), "checked against DEST: {err}");
+    // The turn starts over at the first configured destination.
+    assert_eq!(paid_addresses(&f), [A]);
+    let s = state(dir.path());
+    assert_eq!(s["in_flight"], Value::Null);
+    assert_eq!(s["pending_check"], Value::Null);
+    assert_eq!(s["last_destination"], json!(A));
+    assert_eq!(
+        s["sent_today"],
+        json!(2_500_000_000u64),
+        "20 recovered + 5 new"
+    );
+}
+
+#[test]
+fn an_operator_verdict_of_sent_moves_the_turn_on() {
+    // An interrupted transfer to B that the wallet cannot account for: source notes are gone,
+    // but no operation or history entry shows it. The operator checks B and says "sent".
+    let (f, _) = multi_wallet("100", &[]);
+    f.on("z_listunspent", |_| Reply::Ok(json!([])));
+    let dir = tempfile::tempdir().unwrap();
+    interrupted_state(dir.path(), None, true, 1000);
+    let p = dir.path().join("state/refill.state");
+    let text = std::fs::read_to_string(&p).unwrap().replace(DEST, B);
+    std::fs::write(&p, text).unwrap();
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("destinations = [\"{A}\", \"{B}\", \"{C}\"]")),
+    );
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=refill_unsettled"), "{err}");
+    let (code, err) = run(&cfg, &["--resolve-interrupted", "sent"]);
+    assert_eq!(code, 0, "{err}");
+    let s = state(dir.path());
+    assert_eq!(s["last_destination"], json!(B));
+    assert_eq!(s["sent_today"], json!(2_000_000_000u64), "kept");
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(paid_addresses(&f), [C], "B is not paid twice in a row");
+}

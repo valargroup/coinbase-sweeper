@@ -209,3 +209,60 @@ async fn regtest_refill_killed_mid_send_never_sends_twice() {
         assert_eq!(paid[0].1, 25 * 100_000_000);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_refill_drain_above_rotates_three_destinations() {
+    let Some(bin) = node_bin("regtest_refill_drain_above_rotates_three_destinations") else {
+        return;
+    };
+    let pool = Pool::start(&bin).await;
+    pool.fund_ironwood(70).await;
+    let dests: Vec<String> = (11..14)
+        .map(|i| derive_funder_transparent_address(i).unwrap())
+        .collect();
+    let list = dests
+        .iter()
+        .map(|d| format!("\"{d}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cfg = pool.config(
+        "multi.toml",
+        &pool.ua,
+        "",
+        &refill_section(&format!(
+            "mode = \"drain_above\"\ndestinations = [{list}]\n\
+             external_destinations = [{list}]\nreserve = 10\nmax_per_transfer = 5\n\
+             max_per_day = 1000\n"
+        )),
+    );
+    let args = ["refill", "--config", cfg.to_str().unwrap(), "--once"];
+    let from = pool.tip().await;
+
+    // Four transfers: one destination each, in config order, wrapping around.
+    let mut sent = Vec::new();
+    for i in 0..4 {
+        let (code, log) = pool.run_tool_mining(&args, &format!("m{i}.log")).await;
+        eprintln!("{log}");
+        assert_eq!(code, 0, "{log}");
+        let txids = log_values(&log, "event=refilled", "txid");
+        let addrs = log_values(&log, "event=refilled", "addr");
+        assert_eq!(txids.len(), 1, "{log}");
+        let expected = &dests[i % dests.len()];
+        assert_eq!(&addrs[0], expected, "run {i}: {log}");
+        assert_ironwood_only_payment(&pool, &txids[0], expected, zat(5.0)).await;
+        sent.push((txids[0].clone(), expected.clone()));
+        pool.mine(11).await;
+    }
+
+    // On chain: the first destination was paid twice, the others once, each by its own
+    // transaction.
+    for (n, d) in dests.iter().enumerate() {
+        let paid = pool.payments_to(d, from).await;
+        let want: Vec<(String, u64)> = sent
+            .iter()
+            .filter(|(_, a)| a == d)
+            .map(|(t, _)| (t.clone(), zat(5.0)))
+            .collect();
+        assert_eq!(paid, want, "destination {n}");
+    }
+}

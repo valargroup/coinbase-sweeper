@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- `refill.destinations` lists several payout addresses. One refill pays one destination,
+  never several in one transaction. In `drain_above` mode the destinations take turns in the
+  order listed, and the last destination paid is kept in the state file so the order survives
+  restarts. In `top_up` mode each cycle refills the destination with the lowest balance below
+  `low_water`. `max_per_transfer`, `max_per_day`, `min_transfer` and `fee_headroom` apply to all
+  destinations together. External destinations are confirmed by listing them again in
+  `refill.external_destinations`.
+- A single `refill.destination` (with `external_destination`) works as before.
+
 ## [0.1.0] - 2026-11-26
 
 First release of coinbase-sweeper for Zcash mining pools using zecd with mining-pool

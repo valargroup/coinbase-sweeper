@@ -98,10 +98,19 @@ pub enum RefillMode {
 #[serde(deny_unknown_fields)]
 pub struct RefillConfig {
     pub mode: RefillMode,
-    pub destination: String,
+    /// One payout destination. Set this or `destinations`, not both.
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// Several payout destinations. Each transfer pays one of them: in turn (drain_above) or the
+    /// emptiest (top_up).
+    #[serde(default)]
+    pub destinations: Option<Vec<String>>,
     /// Must repeat `destination` when the wallet does not own it.
     #[serde(default)]
     pub external_destination: Option<String>,
+    /// With `destinations`: must list again each destination the wallet does not own.
+    #[serde(default)]
+    pub external_destinations: Option<Vec<String>>,
     #[serde(default, deserialize_with = "opt_zec")]
     pub low_water: Option<Zat>,
     #[serde(default, deserialize_with = "opt_zec")]
@@ -300,22 +309,7 @@ impl Config {
                     .refill
                     .as_ref()
                     .context("the [refill] section is missing")?;
-                ensure!(
-                    !r.destination.trim().is_empty(),
-                    "refill.destination is required"
-                );
-                ensure!(
-                    r.destination != self.shielded_address,
-                    "refill.destination must differ from shielded_address"
-                );
-                if let Some(ext) = &r.external_destination {
-                    ensure!(
-                        ext == &r.destination,
-                        "refill.external_destination ({ext}) does not match refill.destination \
-                         ({}); they must be the same address, written twice",
-                        r.destination
-                    );
-                }
+                r.validate_destinations(&self.shielded_address)?;
                 match r.mode {
                     RefillMode::TopUp => {
                         let low = r.low_water.context("top_up mode needs refill.low_water")?;
@@ -372,6 +366,84 @@ impl Config {
 
     pub fn submit_timeout(&self) -> Duration {
         Duration::from_secs(self.rpc.submit_timeout_secs)
+    }
+}
+
+impl RefillConfig {
+    /// The configured destinations, in config order. A single `destination` is a one-item list.
+    pub fn destinations(&self) -> &[String] {
+        match (&self.destinations, &self.destination) {
+            (Some(list), _) => list,
+            (None, Some(one)) => std::slice::from_ref(one),
+            (None, None) => &[],
+        }
+    }
+
+    /// Whether the operator confirmed `dest` as an external payout wallet by writing it twice.
+    pub fn confirmed_external(&self, dest: &str) -> bool {
+        self.external_destination.as_deref() == Some(dest)
+            || self
+                .external_destinations
+                .iter()
+                .flatten()
+                .any(|e| e == dest)
+    }
+
+    fn validate_destinations(&self, shielded_address: &str) -> Result<()> {
+        match (&self.destination, &self.destinations) {
+            (Some(_), Some(_)) => {
+                bail!("set refill.destination or refill.destinations, not both")
+            }
+            (None, None) => bail!("refill.destination or refill.destinations is required"),
+            (Some(_), None) => ensure!(
+                self.external_destinations.is_none(),
+                "refill.external_destinations goes with refill.destinations; with a single \
+                 refill.destination use refill.external_destination"
+            ),
+            (None, Some(list)) => {
+                ensure!(
+                    !list.is_empty(),
+                    "refill.destinations must list at least one address"
+                );
+                ensure!(
+                    self.external_destination.is_none(),
+                    "refill.external_destination goes with refill.destination; with \
+                     refill.destinations use refill.external_destinations"
+                );
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for d in self.destinations() {
+            ensure!(
+                !d.trim().is_empty(),
+                "refill destination addresses must not be empty"
+            );
+            ensure!(
+                d != shielded_address,
+                "refill destination {d} must differ from shielded_address"
+            );
+            ensure!(seen.insert(d), "refill.destinations lists {d} twice");
+        }
+        if let (Some(ext), Some(dest)) = (&self.external_destination, &self.destination) {
+            ensure!(
+                ext == dest,
+                "refill.external_destination ({ext}) does not match refill.destination \
+                 ({dest}); they must be the same address, written twice"
+            );
+        }
+        let mut seen_ext = std::collections::HashSet::new();
+        for ext in self.external_destinations.iter().flatten() {
+            ensure!(
+                self.destinations().contains(ext),
+                "refill.external_destinations lists {ext}, which is not in \
+                 refill.destinations; each must be a destination, written twice"
+            );
+            ensure!(
+                seen_ext.insert(ext),
+                "refill.external_destinations lists {ext} twice"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -483,6 +555,95 @@ state_dir = "/tmp/x"
             .validate_for(Command::Refill)
             .is_err());
         assert!(with(ok).unwrap().validate_for(Command::Sweep).is_err());
+    }
+
+    fn refill_err(body: &str) -> String {
+        let e = with(&format!(
+            "[refill]\nmode = \"drain_above\"\nreserve = 1\nmax_per_transfer = 10\n\
+             max_per_day = 20\n{body}"
+        ))
+        .unwrap()
+        .validate_for(Command::Refill)
+        .unwrap_err();
+        e.to_string()
+    }
+
+    fn refill_ok(body: &str) -> RefillConfig {
+        let c = with(&format!(
+            "[refill]\nmode = \"drain_above\"\nreserve = 1\nmax_per_transfer = 10\n\
+             max_per_day = 20\n{body}"
+        ))
+        .unwrap();
+        c.validate_for(Command::Refill).unwrap();
+        c.refill.unwrap()
+    }
+
+    #[test]
+    fn single_destination_is_a_one_item_list() {
+        let r = refill_ok("destination = \"t1\"\n");
+        assert_eq!(r.destinations(), ["t1"]);
+        assert!(!r.confirmed_external("t1"));
+        let r = refill_ok("destination = \"t1\"\nexternal_destination = \"t1\"\n");
+        assert!(r.confirmed_external("t1"));
+    }
+
+    #[test]
+    fn several_destinations() {
+        let r = refill_ok(
+            "destinations = [\"t1\", \"t2\", \"t3\"]\nexternal_destinations = [\"t3\"]\n",
+        );
+        assert_eq!(r.destinations(), ["t1", "t2", "t3"]);
+        assert!(r.confirmed_external("t3"));
+        assert!(!r.confirmed_external("t1"));
+    }
+
+    #[test]
+    fn destination_errors() {
+        let cases = [
+            ("", "is required"),
+            (
+                "destination = \"t1\"\ndestinations = [\"t2\"]\n",
+                "not both",
+            ),
+            ("destinations = []\n", "at least one"),
+            (
+                "destinations = [\"t1\", \"t2\", \"t1\"]\n",
+                "lists t1 twice",
+            ),
+            ("destinations = [\"t1\", \"\"]\n", "must not be empty"),
+            (
+                "destinations = [\"t1\", \"uregtest1abc\"]\n",
+                "differ from shielded_address",
+            ),
+            (
+                "destination = \"uregtest1abc\"\n",
+                "differ from shielded_address",
+            ),
+            (
+                "destinations = [\"t1\"]\nexternal_destinations = [\"t2\"]\n",
+                "not in refill.destinations",
+            ),
+            (
+                "destinations = [\"t1\"]\nexternal_destinations = [\"t1\", \"t1\"]\n",
+                "lists t1 twice",
+            ),
+            (
+                "destinations = [\"t1\"]\nexternal_destination = \"t1\"\n",
+                "use refill.external_destinations",
+            ),
+            (
+                "destination = \"t1\"\nexternal_destinations = [\"t1\"]\n",
+                "use refill.external_destination",
+            ),
+            (
+                "destination = \"t1\"\nexternal_destination = \"t2\"\n",
+                "does not match",
+            ),
+        ];
+        for (body, want) in cases {
+            let e = refill_err(body);
+            assert!(e.contains(want), "{body:?}: {e}");
+        }
     }
 
     #[test]

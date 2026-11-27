@@ -10,7 +10,10 @@ It has two commands, which run on their own or together:
 
 - `sweep` shields mature transparent coinbase into the pool's Orchard-only unified address,
   where it is held as Ironwood notes.
-- `refill` moves funds from that address to the pool's payout address or payout wallet.
+- `refill` moves funds from that address to the pool's payout address or payout wallet. With
+  several payout addresses (`refill.destinations`), one refill pays one of them: in turn in
+  `drain_above` mode, or the one with the lowest balance in `top_up` mode. The caps apply to
+  all destinations together.
 
 What it is not: it does not pay miners (your pool software still does), it never holds keys
 (the wallet signs everything), it never sets fees (the wallet pays the standard ZIP 317 fee),
