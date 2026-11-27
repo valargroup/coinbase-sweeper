@@ -1,5 +1,7 @@
 //! `refill`: moves funds from the pool's Orchard-only unified address (its Ironwood notes) to
-//! one configured payout destination, within per-transfer and per-day caps.
+//! the configured payout destinations, within per-transfer and per-day caps shared by all of
+//! them. Each transfer pays exactly one destination: the next in turn (drain_above) or the one
+//! with the lowest balance (top_up).
 //!
 //! Crash safety rests on the state file. Before every send the tool records the transfer as in
 //! flight, with the source's unspent notes at that moment, and adds it to the day's total; then
@@ -10,7 +12,7 @@
 pub mod decide;
 pub mod recover;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -26,7 +28,7 @@ use crate::state::now_unix;
 use crate::txcheck;
 use crate::wallet::{ChainStatus, OpState, TxStatus};
 
-use decide::{decide, utc_day, Decision};
+use decide::{decide, lowest_balance, next_in_turn, utc_day, Decision};
 use recover::Settled;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -75,6 +77,9 @@ pub struct RefillState {
     pub unconfirmed: Option<String>,
     #[serde(default)]
     pub last_txid: Option<String>,
+    /// The destination the last settled transfer paid; drain_above pays the next one after it.
+    #[serde(default)]
+    pub last_destination: Option<String>,
 }
 
 impl RefillState {
@@ -109,8 +114,9 @@ impl<'de> serde::Deserialize<'de> for Zat {
 
 pub struct Refill {
     cfg: RefillConfig,
-    /// Learned at startup: a transparent destination gets a transparent output.
-    transparent_destination: bool,
+    /// Learned at startup for each configured destination: a transparent destination gets a
+    /// transparent output.
+    transparent: HashMap<String, bool>,
 }
 
 fn load_state(ctx: &Ctx) -> Result<RefillState> {
@@ -123,7 +129,7 @@ impl Refill {
     pub fn new(cfg: RefillConfig) -> Refill {
         Refill {
             cfg,
-            transparent_destination: false,
+            transparent: HashMap::new(),
         }
     }
 
@@ -131,65 +137,37 @@ impl Refill {
         Ok(ctx.state.write_json("state", s)?)
     }
 
-    fn policy(&self) -> &'static str {
-        if self.transparent_destination {
-            "AllowRevealedRecipients"
-        } else {
-            "FullPrivacy"
+    /// Whether `dest` is transparent. A destination recorded in the state but since removed
+    /// from the config was not looked at during startup, so the wallet is asked now.
+    fn is_transparent(&self, ctx: &Ctx, dest: &str) -> Result<bool, CycleError> {
+        if let Some(t) = self.transparent.get(dest) {
+            return Ok(*t);
         }
+        let v = ctx.rpc.read("validateaddress", json!([dest]))?;
+        Ok(v.get("isvalid").and_then(Value::as_bool) == Some(true))
+    }
+}
+
+fn policy(transparent: bool) -> &'static str {
+    if transparent {
+        "AllowRevealedRecipients"
+    } else {
+        "FullPrivacy"
     }
 }
 
 impl Job for Refill {
     fn startup(&mut self, ctx: &Ctx) -> Result<(), StartupError> {
         startup::check_shielded_address(ctx)?;
-        let dest = &self.cfg.destination;
         let wallet = ctx.wallet();
-        self.transparent_destination = startup::is_transparent(ctx, dest)?;
-        let owned = if self.transparent_destination {
-            wallet.is_mine(dest, false)?
-        } else {
-            let receivers = wallet.unified_receivers(dest).map_err(|e| {
-                if e.is_transient() {
-                    StartupError::from(e)
-                } else {
-                    StartupError::Refuse(anyhow!(
-                        "refill.destination {dest} is neither a transparent address nor a \
-                         unified address: {e}"
-                    ))
-                }
-            })?;
-            if !receivers.iter().any(|r| r == "orchard") {
-                return Err(StartupError::Refuse(anyhow!(
-                    "refill.destination {dest} has no Orchard receiver, so a transfer to it \
-                     could not stay in Ironwood"
-                )));
-            }
-            wallet.is_mine(dest, true)?
-        };
-        if !owned && self.cfg.external_destination.as_deref() != Some(dest.as_str()) {
-            return Err(StartupError::Refuse(anyhow!(
-                "refill.destination {dest} does not belong to this wallet. If it is an external \
-                 payout wallet, confirm it by also setting external_destination = \"{dest}\""
-            )));
-        }
-        if self.cfg.mode == RefillMode::TopUp && !(owned && self.transparent_destination) {
-            return Err(StartupError::Refuse(anyhow!(
-                "top_up mode needs a transparent destination this wallet owns (it reads that \
-                 address's balance); use drain_above for any other destination"
-            )));
+        for dest in self.cfg.destinations().to_vec() {
+            self.check_destination(ctx, &dest)?;
         }
         if !ctx.dry_run {
             wallet
                 .settled_operations(op_timeout(ctx))
                 .map_err(|e| StartupError::Unavailable(format!("{e:#}")))?;
         }
-        log::info!(
-            "event=refill_destination cmd=refill addr={dest} owned={owned} transparent={} \
-             mode={:?}",
-            self.transparent_destination,
-            self.cfg.mode
-        );
         Ok(())
     }
 
@@ -210,18 +188,14 @@ impl Job for Refill {
         let wallet = ctx.wallet();
         let ua = &ctx.cfg.shielded_address;
         let spendable = wallet.balance(ua, self.cfg.minconf)?;
-        let dest_balance = match self.cfg.mode {
-            RefillMode::TopUp => Some(self.destination_balance(ctx)?),
-            RefillMode::DrainAbove => None,
-        };
+        let (dest, dest_balance) = self.choose_destination(ctx, &state)?;
         // The waits above can cross UTC midnight: charge the transfer to the day it is sent.
         state.roll_over(utc_day(now_unix()));
         let amount = match decide(&self.cfg, spendable, dest_balance, state.sent_today) {
             Decision::Skip(reason) => {
                 log::info!(
-                    "event=refill_skip cmd=refill addr={} source_spendable={spendable} \
+                    "event=refill_skip cmd=refill addr={dest} source_spendable={spendable} \
                      dest_balance={} sent_today={} reason={reason:?}",
-                    self.cfg.destination,
                     dest_balance.map_or("n/a".into(), |b| b.to_string()),
                     state.sent_today
                 );
@@ -231,26 +205,100 @@ impl Job for Refill {
         };
         if ctx.dry_run {
             log::info!(
-                "event=dry_run cmd=refill addr={} would_send={amount} source_spendable={spendable} \
-                 sent_today={} max_per_day={}",
-                self.cfg.destination,
+                "event=dry_run cmd=refill addr={dest} would_send={amount} \
+                 source_spendable={spendable} sent_today={} max_per_day={}",
                 state.sent_today,
                 self.cfg.max_per_day
             );
             return Ok(());
         }
-        self.send(ctx, &mut state, amount)
+        self.send(ctx, &mut state, &dest, amount)
     }
 }
 
 impl Refill {
-    /// The destination's payable balance, including unconfirmed receipts so a transfer still in
+    /// Startup checks for one destination: what kind of address it is, that the wallet owns it
+    /// or the operator confirmed it as external, and that top_up can read its balance.
+    fn check_destination(&mut self, ctx: &Ctx, dest: &str) -> Result<(), StartupError> {
+        let wallet = ctx.wallet();
+        let transparent = startup::is_transparent(ctx, dest)?;
+        let owned = if transparent {
+            wallet.is_mine(dest, false)?
+        } else {
+            let receivers = wallet.unified_receivers(dest).map_err(|e| {
+                if e.is_transient() {
+                    StartupError::from(e)
+                } else {
+                    StartupError::Refuse(anyhow!(
+                        "refill destination {dest} is neither a transparent address nor a \
+                         unified address: {e}"
+                    ))
+                }
+            })?;
+            if !receivers.iter().any(|r| r == "orchard") {
+                return Err(StartupError::Refuse(anyhow!(
+                    "refill destination {dest} has no Orchard receiver, so a transfer to it \
+                     could not stay in Ironwood"
+                )));
+            }
+            wallet.is_mine(dest, true)?
+        };
+        if !owned && !self.cfg.confirmed_external(dest) {
+            let fix = if self.cfg.destinations.is_some() {
+                format!("also listing it in external_destinations = [\"{dest}\"]")
+            } else {
+                format!("also setting external_destination = \"{dest}\"")
+            };
+            return Err(StartupError::Refuse(anyhow!(
+                "refill destination {dest} does not belong to this wallet. If it is an external \
+                 payout wallet, confirm it by {fix}"
+            )));
+        }
+        if self.cfg.mode == RefillMode::TopUp && !(owned && transparent) {
+            return Err(StartupError::Refuse(anyhow!(
+                "top_up mode needs transparent destinations this wallet owns (it reads their \
+                 balances), and {dest} is not one; use drain_above for any other destination"
+            )));
+        }
+        self.transparent.insert(dest.to_owned(), transparent);
+        log::info!(
+            "event=refill_destination cmd=refill addr={dest} owned={owned} \
+             transparent={transparent} mode={:?}",
+            self.cfg.mode
+        );
+        Ok(())
+    }
+
+    /// The destination this cycle's transfer would pay, and its balance in top_up mode.
+    fn choose_destination(
+        &self,
+        ctx: &Ctx,
+        state: &RefillState,
+    ) -> Result<(String, Option<Zat>), CycleError> {
+        let destinations = self.cfg.destinations();
+        match self.cfg.mode {
+            RefillMode::DrainAbove => Ok((
+                next_in_turn(destinations, state.last_destination.as_deref()).to_owned(),
+                None,
+            )),
+            RefillMode::TopUp => {
+                let mut balances = Vec::with_capacity(destinations.len());
+                for d in destinations {
+                    balances.push((d.clone(), self.destination_balance(ctx, d)?));
+                }
+                let (dest, balance) = lowest_balance(&balances)
+                    .cloned()
+                    .expect("validated: at least one destination");
+                Ok((dest, Some(balance)))
+            }
+        }
+    }
+
+    /// A destination's payable balance, including unconfirmed receipts so a transfer still in
     /// the mempool is not topped up twice. Coinbase at the destination is left out: it cannot
     /// pay miners until it is shielded, so it must not make the address look funded.
-    fn destination_balance(&self, ctx: &Ctx) -> Result<Zat, CycleError> {
-        let utxos = ctx
-            .wallet()
-            .list_unspent(0, std::slice::from_ref(&self.cfg.destination))?;
+    fn destination_balance(&self, ctx: &Ctx, dest: &str) -> Result<Zat, CycleError> {
+        let utxos = ctx.wallet().list_unspent(0, &[dest.to_owned()])?;
         let mut total = Zat::ZERO;
         for u in utxos.into_iter().filter(|u| !u.generated) {
             total = total
@@ -260,12 +308,18 @@ impl Refill {
         Ok(total)
     }
 
-    fn send(&self, ctx: &Ctx, state: &mut RefillState, amount: Zat) -> Result<(), CycleError> {
+    fn send(
+        &self,
+        ctx: &Ctx,
+        state: &mut RefillState,
+        dest: &str,
+        amount: Zat,
+    ) -> Result<(), CycleError> {
         // The waits earlier in the cycle can be long: a halt set meanwhile still stops this send.
         if let Some(reason) = ctx.state.halted()? {
             return Err(CycleError::Failed(anyhow!("sending is halted: {reason}")));
         }
-        let dest = self.cfg.destination.clone();
+        let transparent = self.is_transparent(ctx, dest)?;
         let wallet = ctx.wallet();
         let ops_before: BTreeSet<String> = wallet.operation_ids()?.into_iter().collect();
         let notes_before = recover::source_notes(ctx)?;
@@ -279,7 +333,7 @@ impl Refill {
             started_unix: now_unix(),
             day: state.day,
             amount,
-            destination: dest.clone(),
+            destination: dest.to_owned(),
             opid: None,
             ops_before,
             notes_before,
@@ -295,7 +349,7 @@ impl Refill {
             [{"address": dest, "amount": amount.to_json()}],
             self.cfg.minconf,
             Value::Null,
-            self.policy()
+            policy(transparent)
         ]);
         let opid = match ctx.rpc.submit("z_sendmany", params) {
             Ok(v) => match v.as_str() {
@@ -471,6 +525,7 @@ impl Refill {
         state.pending_check = Some(pending.clone());
         state.unconfirmed = Some(txid.to_owned());
         state.last_txid = Some(txid.to_owned());
+        state.last_destination = Some(f.destination.clone());
         self.save(ctx, state)?;
         log::info!(
             "event=refilled cmd=refill addr={} amount={} txid={txid} sent_today={} \
@@ -499,10 +554,13 @@ impl Refill {
                 )))
             }
         };
+        // The destination recorded with the transfer, not the current config: it may have been
+        // removed from the config since.
+        let transparent = self.is_transparent(ctx, &p.destination)?;
         if let Err(e) = txcheck::check_refill(
             &tx,
             &p.destination,
-            self.transparent_destination,
+            transparent,
             p.amount,
             self.cfg.fee_headroom,
         ) {
@@ -578,6 +636,7 @@ pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
                 });
                 state.unconfirmed = Some(txid.clone());
                 state.last_txid = Some(txid.clone());
+                state.last_destination = Some(f.destination.clone());
             }
             _ if resolution == Resolution::NotSent => state.refund(&f),
             _ => {}
@@ -630,9 +689,20 @@ pub fn check_lines(ctx: &Ctx) -> Result<Vec<String>> {
     let cfg = ctx.cfg.refill.as_ref().expect("validated");
     let state = load_state(ctx)?;
     let mut lines = vec![format!(
-        "refill today: sent={} max_per_day={} max_per_transfer={} mode={:?} destination={}",
-        state.sent_today, cfg.max_per_day, cfg.max_per_transfer, cfg.mode, cfg.destination
+        "refill today: sent={} max_per_day={} max_per_transfer={} mode={:?} destinations={}",
+        state.sent_today,
+        cfg.max_per_day,
+        cfg.max_per_transfer,
+        cfg.mode,
+        cfg.destinations().join(",")
     )];
+    if cfg.mode == RefillMode::DrainAbove {
+        lines.push(format!(
+            "refill next destination: {} (last paid: {})",
+            next_in_turn(cfg.destinations(), state.last_destination.as_deref()),
+            state.last_destination.as_deref().unwrap_or("none")
+        ));
+    }
     let spendable = ctx
         .wallet()
         .balance(&ctx.cfg.shielded_address, cfg.minconf)?;
@@ -697,6 +767,22 @@ mod tests {
         s.sent_today = Zat(100);
         s.refund(&in_flight(10));
         assert_eq!(s.sent_today, Zat(100));
+    }
+
+    #[test]
+    fn last_destination_is_saved_and_old_state_files_still_load() {
+        let s = RefillState {
+            last_destination: Some("t2".into()),
+            ..Default::default()
+        };
+        let back: RefillState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.last_destination.as_deref(), Some("t2"));
+        // A state file written by v0.1.0 has no last_destination: rotation starts at the first.
+        let old: RefillState = serde_json::from_str(
+            r#"{"day": 3, "sent_today": 5, "in_flight": null, "unconfirmed": null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.last_destination, None);
     }
 
     #[test]

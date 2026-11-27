@@ -16,6 +16,23 @@ pub enum Decision {
     Skip(String),
 }
 
+/// drain_above: the destination after `last` in config order, wrapping around. When `last` is
+/// unset or no longer configured, the first.
+pub fn next_in_turn<'a>(destinations: &'a [String], last: Option<&str>) -> &'a str {
+    let after = last
+        .and_then(|l| destinations.iter().position(|d| d == l))
+        .map_or(0, |i| i + 1);
+    &destinations[after % destinations.len()]
+}
+
+/// top_up: the destination with the lowest balance; the first in config order on a tie. If it
+/// is not below low_water, none is, and `decide` skips.
+pub fn lowest_balance(balances: &[(String, Zat)]) -> Option<&(String, Zat)> {
+    balances
+        .iter()
+        .reduce(|best, b| if b.1 < best.1 { b } else { best })
+}
+
 /// `source_spendable` is the pool address's balance at `minconf`; `dest_balance` is the
 /// destination's balance (top_up only); `sent_today` includes any transfer still in flight.
 pub fn decide(
@@ -175,6 +192,40 @@ mod tests {
             decide(&c, zec("100"), None, zec("70")),
             Decision::Skip(_)
         ));
+    }
+
+    fn list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn drain_above_takes_turns_in_config_order() {
+        let d = list(&["a", "b", "c"]);
+        assert_eq!(next_in_turn(&d, None), "a");
+        assert_eq!(next_in_turn(&d, Some("a")), "b");
+        assert_eq!(next_in_turn(&d, Some("b")), "c");
+        assert_eq!(next_in_turn(&d, Some("c")), "a", "wraps around");
+        assert_eq!(
+            next_in_turn(&d, Some("removed")),
+            "a",
+            "a destination no longer configured starts over"
+        );
+        let one = list(&["only"]);
+        assert_eq!(next_in_turn(&one, None), "only");
+        assert_eq!(next_in_turn(&one, Some("only")), "only");
+    }
+
+    #[test]
+    fn top_up_picks_the_lowest_balance() {
+        let b = vec![
+            ("a".to_string(), zec("7")),
+            ("b".to_string(), zec("3")),
+            ("c".to_string(), zec("3")),
+            ("d".to_string(), zec("12")),
+        ];
+        assert_eq!(lowest_balance(&b).unwrap().0, "b", "first of a tie");
+        assert_eq!(lowest_balance(&b[..1]).unwrap().0, "a");
+        assert_eq!(lowest_balance(&[]), None);
     }
 
     #[test]
