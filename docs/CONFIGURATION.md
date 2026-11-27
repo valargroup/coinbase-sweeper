@@ -56,9 +56,11 @@ environment variable, or point `rpc.cookie_file` at the wallet's cookie file.
 
 | Key | Type | Default | Valid values | Meaning |
 | --- | --- | --- | --- | --- |
-| `mode` | string | required | `"top_up"` or `"drain_above"` | `top_up` keeps a wallet-owned transparent address funded. `drain_above` sends everything above `reserve` to the destination. |
-| `destination` | string | required | a transparent address, or a unified address with an Orchard receiver; not `shielded_address` | Where refills go. `top_up` requires a transparent address the wallet owns. Its *payable balance* is its unspent transparent outputs, unconfirmed ones included, except coinbase (rewards, mature or not, cannot pay miners until they are shielded). |
-| `external_destination` | string | none | exactly the same text as `destination` | Required when the wallet does not own `destination` (an external payout wallet). Writing the address twice is deliberate: a typo stops the tool instead of sending money. |
+| `mode` | string | required | `"top_up"` or `"drain_above"` | `top_up` keeps wallet-owned transparent addresses funded. `drain_above` sends everything above `reserve` to the destinations. |
+| `destination` | string | none | a transparent address, or a unified address with an Orchard receiver; not `shielded_address` | Where refills go. Set this or `destinations`, not both; a single `destination` works exactly like a one-item `destinations` list. `top_up` requires a transparent address the wallet owns. Its *payable balance* is its unspent transparent outputs, unconfirmed ones included, except coinbase (rewards, mature or not, cannot pay miners until they are shielded). |
+| `destinations` | list of strings | none | one or more addresses, each as for `destination`, none listed twice | Several payout addresses. One refill pays one destination, never several. In `drain_above` mode they take turns in the order listed: each refill pays the next one after the destination the last refill paid, wrapping around to the first. In `top_up` mode each cycle reads every destination's payable balance and refills the one with the lowest balance, if it is below `low_water`. The caps are shared: `max_per_transfer` and `max_per_day` count all destinations together. |
+| `external_destination` | string | none | exactly the same text as `destination` | With `destination`: required when the wallet does not own `destination` (an external payout wallet). Writing the address twice is deliberate: a typo stops the tool instead of sending money. |
+| `external_destinations` | list of strings | none | each one also in `destinations`, none listed twice | With `destinations`: lists again every destination the wallet does not own. A destination the wallet does not own and that is missing here stops the tool at startup. |
 | `low_water` | amount | none | less than `target` | `top_up` only, required there. A refill happens when the destination's payable balance falls below this. It is a trigger, checked once per cycle, not a floor: a payout larger than the balance above `low_water` can take the balance lower before the next cycle. Set it above your largest single payout run. |
 | `target` | amount | none | more than `low_water` | `top_up` only, required there. A refill sends `target` minus the current payable balance (within the caps). |
 | `reserve` | amount | none | 0 or more | `drain_above` only, required there. The amount left behind, measured as the spendable shielded balance the wallet reports for `shielded_address`. A refill spends from the whole account the address belongs to (on zecd, the whole wallet), so keep the pool's Ironwood funds in their own account. |
@@ -131,6 +133,43 @@ external_destination = "t1examplehotwalletaddressxxxxxxxxx"   # the same address
 reserve = 5                         # keep 5 ZEC in the shielded address
 max_per_transfer = 500
 max_per_day = 2000
+```
+
+### Setup 2 with several payout addresses
+
+Some pools pay miners from several transparent addresses in turn. List them all; each refill
+pays one of them, in the order listed. These payout addresses belong to another wallet, so each
+is written twice.
+
+```toml
+shielded_address = "u1exampleorchardonlyaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[rpc]
+url = "http://127.0.0.1:8232/"
+cookie_file = "/var/lib/zcashd/.cookie"
+
+[general]
+state_dir = "/var/lib/coinbase-sweeper"
+
+[sweep]
+coinbase_addresses = ["t1examplecoinbaseaddressxxxxxxxxxx"]
+alert_unswept_zec = 500
+
+[refill]
+mode = "drain_above"
+destinations = [
+  "t1examplepayoutaddressaxxxxxxxxxx",
+  "t1examplepayoutaddressbxxxxxxxxxx",
+  "t1examplepayoutaddresscxxxxxxxxxx",
+]
+external_destinations = [           # the same addresses, again
+  "t1examplepayoutaddressaxxxxxxxxxx",
+  "t1examplepayoutaddressbxxxxxxxxxx",
+  "t1examplepayoutaddresscxxxxxxxxxx",
+]
+reserve = 5
+max_per_transfer = 100              # each refill pays one address at most 100 ZEC
+max_per_day = 2000                  # all addresses together
 ```
 
 ### Setups 3 and 4

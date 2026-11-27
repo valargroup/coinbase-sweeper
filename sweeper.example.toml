@@ -42,8 +42,12 @@ alert_unswept_zec = 500
 [refill]
 # Required. "top_up" keeps a wallet-owned transparent address between low_water and target.
 mode = "top_up"
-# Required. Where refills go. Here: the pool's own payout address, which this wallet owns.
+# Required: destination or destinations. Where refills go. Here: the pool's own payout
+# address, which this wallet owns.
 destination = "t1replace-with-your-payout-address"
+# Or several payout addresses. One refill pays one of them: in top_up mode the one with the
+# lowest balance below low_water, in drain_above mode each in turn, in the order listed.
+#   destinations = ["t1payout-address-a", "t1payout-address-b"]
 low_water = 50
 target = 200
 # drain_above mode (setup 2) uses these instead of low_water and target:
@@ -51,6 +55,9 @@ target = 200
 #   destination = "t1your-payout-wallet-address"
 #   external_destination = "t1your-payout-wallet-address"   # the same address, written twice
 #   reserve = 5
+# With several payout addresses the wallet does not own, list each one twice:
+#   destinations = ["t1payout-address-a", "t1payout-address-b"]
+#   external_destinations = ["t1payout-address-a", "t1payout-address-b"]
 minconf = 10
 fee_headroom = 0.001
 min_transfer = 0.01
