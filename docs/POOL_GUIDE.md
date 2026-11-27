@@ -59,7 +59,8 @@ destination, never several in one transaction. In `drain_above` mode the destina
 in the order listed: each refill pays the one after the destination the last refill paid, and
 after the last one it starts again at the first. The tool remembers the last destination paid
 in its state file, so the order survives restarts; a destination counts as paid only once its
-transfer is known to have been sent. In `top_up` mode every cycle reads each destination's
+transfer is known to have been sent (from the wallet, or from your `--resolve-interrupted sent`
+verdict). In `top_up` mode every cycle reads each destination's
 payable balance and refills the one with the lowest balance, if that is below `low_water`, up
 to `target`. Either way there is at most one refill per cycle, and `max_per_transfer`,
 `max_per_day`, `min_transfer` and `fee_headroom` apply to all destinations together, not to each.

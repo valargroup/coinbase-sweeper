@@ -678,3 +678,32 @@ fn an_in_flight_transfer_to_a_removed_destination_still_settles() {
         "20 recovered + 5 new"
     );
 }
+
+#[test]
+fn an_operator_verdict_of_sent_moves_the_turn_on() {
+    // An interrupted transfer to B that the wallet cannot account for: source notes are gone,
+    // but no operation or history entry shows it. The operator checks B and says "sent".
+    let (f, _) = multi_wallet("100", &[]);
+    f.on("z_listunspent", |_| Reply::Ok(json!([])));
+    let dir = tempfile::tempdir().unwrap();
+    interrupted_state(dir.path(), None, true, 1000);
+    let p = dir.path().join("state/refill.state");
+    let text = std::fs::read_to_string(&p).unwrap().replace(DEST, B);
+    std::fs::write(&p, text).unwrap();
+    let cfg = multi_config(
+        dir.path(),
+        &f.url,
+        &drain_above(&format!("destinations = [\"{A}\", \"{B}\", \"{C}\"]")),
+    );
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("event=refill_unsettled"), "{err}");
+    let (code, err) = run(&cfg, &["--resolve-interrupted", "sent"]);
+    assert_eq!(code, 0, "{err}");
+    let s = state(dir.path());
+    assert_eq!(s["last_destination"], json!(B));
+    assert_eq!(s["sent_today"], json!(2_000_000_000u64), "kept");
+    let (code, err) = run(&cfg, &["--once"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(paid_addresses(&f), [C], "B is not paid twice in a row");
+}

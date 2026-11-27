@@ -639,7 +639,8 @@ pub fn resolve_interrupted(ctx: &Ctx, resolution: Resolution) -> Exit {
                 state.last_destination = Some(f.destination.clone());
             }
             _ if resolution == Resolution::NotSent => state.refund(&f),
-            _ => {}
+            // The operator saw the transfer arrive: its destination has had its turn.
+            _ => state.last_destination = Some(f.destination.clone()),
         }
         ctx.state.write_json("state", &state)?;
         log::warn!(
